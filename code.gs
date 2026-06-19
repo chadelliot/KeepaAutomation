@@ -30,35 +30,76 @@ function runKeepaHourlyScan() {
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
 
   const props = PropertiesService.getScriptProperties();
-  const pageSize = Number(props.getProperty('KEEPA_HOURLY_PAGE_SIZE') || 50);
-  const maxPages = Number(props.getProperty('KEEPA_MAX_ROTATION_PAGES') || 40);
+  const pageSize = getPositiveIntegerProperty_(props, 'KEEPA_HOURLY_PAGE_SIZE', 50);
+  const maxPages = getPositiveIntegerProperty_(props, 'KEEPA_MAX_ROTATION_PAGES', 40);
+  const maxCandidatesToEvaluate = getPositiveIntegerProperty_(props, 'KEEPA_BRAND_DIVERSITY_SCAN_LIMIT', 250);
   const currentPage = Number(props.getProperty('KEEPA_QUERY_PAGE') || 0);
-  const nextPage = (currentPage + 1) % maxPages;
+  const requestedPagesToScan = Math.max(1, Math.ceil(maxCandidatesToEvaluate / pageSize));
+  const maxPagesToScan = Math.min(requestedPagesToScan, maxPages);
 
-  props.setProperty('KEEPA_QUERY_PAGE', String(nextPage));
+  let pagesScanned = 0;
+  let candidatesFetched = 0;
+  let nextPage = currentPage;
+  const products = [];
 
   try {
     log_(logSheet, `Started hourly Keepa scan - page ${currentPage}`);
 
     const apiKey = getScriptProperty_('KEEPA_API_KEY');
-    const asins = fetchKeepaAsins_(apiKey, pageSize, currentPage);
 
-    log_(logSheet, `Fetched ${asins.length} ASINs from Keepa query page ${currentPage}`);
+    if (requestedPagesToScan > maxPages) {
+      log_(logSheet, `WARNING Keepa brand diversity scan would wrap past configured rotation pages (${requestedPagesToScan}/${maxPages}); stopping before repeated page/API calls.`);
+    }
 
-    if (!asins.length) {
+    while (pagesScanned < maxPagesToScan && candidatesFetched < maxCandidatesToEvaluate) {
+      const page = (currentPage + pagesScanned) % maxPages;
+      const asins = fetchKeepaAsins_(apiKey, pageSize, page);
+      candidatesFetched += asins.length;
+
+      log_(logSheet, `Fetched ${asins.length} ASINs from Keepa query page ${page}`);
+
+      if (!asins.length) break;
+
+      const remainingEvaluationSlots = Math.max(0, maxCandidatesToEvaluate - (candidatesFetched - asins.length));
+      const asinsToFetch = asins.slice(0, remainingEvaluationSlots);
+      const pageProducts = fetchKeepaProducts_(apiKey, asinsToFetch);
+      products.push.apply(products, pageProducts);
+      log_(logSheet, `Fetched product details for ${pageProducts.length} ASINs from page ${page}`);
+
+      pagesScanned++;
+      nextPage = (page + 1) % maxPages;
+
+      const preview = selectKeepaProductsForAppend_(ss, products, pageSize, props);
+      if (preview.rows.length >= pageSize) break;
+
+      if (pagesScanned >= maxPagesToScan && preview.rows.length < pageSize) {
+        log_(logSheet, `WARNING Keepa brand diversity scan limit reached before filling target: ${preview.rows.length}/${pageSize} qualified diverse products.`);
+      }
+    }
+
+    props.setProperty('KEEPA_QUERY_PAGE', String(nextPage));
+
+    if (!products.length) {
       log_(logSheet, 'No ASINs returned. Check Keepa Product Finder filters or KEEPA_SELECTION_JSON.');
       return;
     }
 
-    const products = fetchKeepaProducts_(apiKey, asins);
-    log_(logSheet, `Fetched product details for ${products.length} ASINs`);
-
-    appendDailyKeepaPull_(ss, products);
+    const appendStats = appendDailyKeepaPull_(ss, products, { appendLimit: pageSize });
 
     SpreadsheetApp.flush();
+    log_(logSheet, `Keepa candidates fetched: ${candidatesFetched}`);
+    log_(logSheet, `Keepa candidates evaluated: ${appendStats.evaluated}`);
+    log_(logSheet, `Candidates passing opportunity filter: ${appendStats.opportunityPasses}`);
+    log_(logSheet, `Products appended: ${appendStats.appended}`);
+    log_(logSheet, `Products skipped due to brand cap: ${appendStats.brandCapSkips}`);
+    log_(logSheet, `Top capped brands: ${appendStats.topCappedBrands || 'None'}`);
+    log_(logSheet, `Duplicate skips: ${appendStats.duplicateSkips}`);
+    log_(logSheet, `Weak/opportunity-filter skips: ${appendStats.weakSkips}`);
+    log_(logSheet, `Deeper page scanning used: ${pagesScanned > 1 ? 'Yes' : 'No'} (${pagesScanned} page${pagesScanned === 1 ? '' : 's'})`);
     log_(logSheet, `Completed hourly Keepa scan - next page will be ${nextPage}`);
 
   } catch (err) {
+    props.setProperty('KEEPA_QUERY_PAGE', String(nextPage));
     log_(logSheet, `ERROR hourly Keepa scan page ${currentPage}: ${err.message}`);
     throw err;
   }
@@ -803,7 +844,7 @@ function isRiskySource_(source) {
 function isRiskyProduct_(title, brand) {
   const t = normalize_(`${brand || ''} ${title || ''}`);
 
-  return /amazon fire|fire 7|iphone|renewed|refurb|locked|software|download|turbotax|coin|commemorative/.test(t);
+  return /amazon fire|fire 7|iphone|renewed|refurb|refurbished|locked|software|download|app store|digital code|gift card|subscription|subscribe|turbotax|coin|commemorative/.test(t);
 }
 
 
@@ -1080,25 +1121,18 @@ function setupDailyKeepaHeaders_(ss) {
   sheet.setFrozenRows(1);
 }
 
-function appendDailyKeepaPull_(ss, products) {
+function appendDailyKeepaPull_(ss, products, options) {
   const sheet = getOrCreateSheet_(ss, SHEETS.DAILY_KEEPA_PULL);
   setupDailyKeepaHeaders_(ss);
 
-  const existingAsins = getExistingAsins_(sheet);
-  const rows = [];
-
-  products.forEach(product => {
-    const asin = product.asin;
-    if (!asin || existingAsins.has(asin)) return;
-
-    rows.push(buildKeepaRow_(product));
-    existingAsins.add(asin);
-  });
+  const appendLimit = options && options.appendLimit ? Number(options.appendLimit) : products.length;
+  const selection = selectKeepaProductsForAppend_(ss, products, appendLimit, PropertiesService.getScriptProperties());
+  const rows = selection.rows;
 
   if (!rows.length) {
     const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
-    log_(logSheet, 'No new ASINs to append after dedupe');
-    return;
+    log_(logSheet, 'No new ASINs/UPCs to append after dedupe, brand diversity, and opportunity filtering');
+    return selection;
   }
 
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
@@ -1109,6 +1143,138 @@ function appendDailyKeepaPull_(ss, products) {
 
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
   log_(logSheet, `Appended ${rows.length} new products to Daily Keepa Pull`);
+  return selection;
+}
+
+function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
+  const maxPerBrand = getPositiveIntegerProperty_(props, 'KEEPA_MAX_NEW_PRODUCTS_PER_BRAND', 5);
+  const existingProductKeys = getExistingProductKeysAcrossSheets_(ss, [
+    SHEETS.DAILY_KEEPA_PULL,
+    SHEETS.SOURCE_LINK_FINDER,
+    SHEETS.SOURCE_LINK_FINDER_ARCHIVE,
+    SHEETS.SOURCE_SEARCH_QUEUE,
+    SHEETS.SOURCE_MATCHES
+  ]);
+  const seenAsins = new Set();
+  const seenUpcs = new Set();
+  const byBrand = {};
+  const stats = {
+    rows: [],
+    evaluated: 0,
+    opportunityPasses: 0,
+    duplicateSkips: 0,
+    weakSkips: 0,
+    brandCapSkips: 0,
+    topCappedBrands: '',
+    appended: 0
+  };
+
+  products.forEach(product => {
+    stats.evaluated++;
+    const asin = String(product.asin || '').trim();
+    const upc = getUpc_(product);
+
+    if (!asin || seenAsins.has(asin) || existingProductKeys.asins.has(asin) || (upc && (seenUpcs.has(upc) || existingProductKeys.upcs.has(upc)))) {
+      stats.duplicateSkips++;
+      return;
+    }
+
+    seenAsins.add(asin);
+    if (upc) seenUpcs.add(upc);
+
+    const opportunity = evaluateKeepaIngestOpportunity_(product);
+    if (!opportunity.eligible) {
+      stats.weakSkips++;
+      return;
+    }
+
+    stats.opportunityPasses++;
+    const brandKey = normalizeBrandKey_(product.brand);
+    if (!byBrand[brandKey]) byBrand[brandKey] = [];
+    byBrand[brandKey].push({ product, opportunity });
+  });
+
+  const cappedBrandSkips = {};
+  const selected = [];
+  Object.keys(byBrand).forEach(brandKey => {
+    const candidates = byBrand[brandKey].sort((a, b) => b.opportunity.score - a.opportunity.score);
+    const keep = candidates.slice(0, maxPerBrand);
+    selected.push.apply(selected, keep);
+    if (candidates.length > maxPerBrand) cappedBrandSkips[brandKey] = candidates.length - maxPerBrand;
+  });
+
+  selected
+    .sort((a, b) => b.opportunity.score - a.opportunity.score)
+    .slice(0, appendLimit)
+    .forEach(item => stats.rows.push(buildKeepaRow_(item.product)));
+
+  const selectedByBrand = {};
+  stats.rows.forEach(row => {
+    const brandKey = normalizeBrandKey_(row[3]);
+    selectedByBrand[brandKey] = (selectedByBrand[brandKey] || 0) + 1;
+  });
+  Object.keys(selectedByBrand).forEach(brandKey => {
+    const overflow = Math.max(0, (byBrand[brandKey] || []).length - selectedByBrand[brandKey]);
+    if (overflow) cappedBrandSkips[brandKey] = Math.max(cappedBrandSkips[brandKey] || 0, overflow);
+  });
+
+  stats.appended = stats.rows.length;
+  stats.brandCapSkips = Object.keys(cappedBrandSkips).reduce((sum, brand) => sum + cappedBrandSkips[brand], 0);
+  stats.topCappedBrands = formatTopCappedBrands_(cappedBrandSkips);
+  return stats;
+}
+
+function evaluateKeepaIngestOpportunity_(product) {
+  const stats = product.stats || {};
+  const title = product.title || '';
+  const brand = product.brand || '';
+  const likelySellPrice = centsToDollars_(getStatValue_(stats.current, 18)) || centsToDollars_(getStatValue_(stats.avg90, 18));
+  const lowestFba = centsToDollars_(getStatValue_(stats.current, 10));
+  const maxBuyCost = likelySellPrice ? round_(likelySellPrice * 0.7 - 2, 2) : 0;
+  const expectedProfit = lowestFba && maxBuyCost ? round_(lowestFba - maxBuyCost, 2) : (maxBuyCost ? 2 : 0);
+  const margin = likelySellPrice && expectedProfit ? expectedProfit / likelySellPrice : null;
+  const monthlySales = Number(product.monthlySold || product.monthlySoldHistory || 0);
+  const rankDrops30 = Number(product.salesRankDrops30 || 0);
+  const velocityStrong = monthlySales >= 50 || rankDrops30 >= 10 || (!monthlySales && !rankDrops30);
+  const marginOk = margin === null || margin >= 0.15;
+  const profitOk = expectedProfit >= 2;
+  const allowedProduct = !isRiskyProduct_(title, brand);
+  const riskAllowed = !isRestrictedKeepaBrand_(brand, product);
+  const titleQualityScore = getKeepaTitleQualityScore_(title);
+  const score = scoreOpportunity_({
+    monthlySales,
+    rankDrops30,
+    newOfferCount: getStatValue_(stats.current, 11) || 0,
+    fbaOfferCount: getFbaOfferCount_(product),
+    amazonOosPct: 0,
+    aboveBuyBoxSpread: lowestFba && likelySellPrice ? lowestFba - likelySellPrice : 0,
+    likelySellPrice
+  }) + (profitOk ? 20 : 0) + (marginOk ? 15 : 0) + titleQualityScore + (riskAllowed ? 5 : -25);
+
+  return {
+    eligible: Boolean(maxBuyCost && likelySellPrice && marginOk && profitOk && velocityStrong && allowedProduct && riskAllowed),
+    score
+  };
+}
+
+function getKeepaTitleQualityScore_(title) {
+  const normalizedTitle = normalize_(title);
+  if (!normalizedTitle) return -20;
+  let score = Math.min(10, normalizedTitle.length / 12);
+  if (/bundle|lot of|mystery|unknown|damaged|parts only/.test(normalizedTitle)) score -= 10;
+  return score;
+}
+
+function isRestrictedKeepaBrand_(brand, product) {
+  const riskText = normalize_([
+    brand,
+    product && product.brandRisk,
+    product && product.restriction,
+    product && product.restricted,
+    product && product.isHazMat,
+    product && product.isAdultProduct
+  ].join(' '));
+  return /restricted|hazmat|adult|dangerous|gated/.test(riskText);
 }
 
 function getExistingAsins_(sheet) {
