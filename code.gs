@@ -109,13 +109,14 @@ function moveSourceSearchQueueToSourceLinkFinder() {
   try {
     log_(logSheet, `Started Source Search Queue transfer. Finder target: ${finderTarget}, max per brand: ${maxPerBrand}, queue scan limit: ${queueScanLimit}`);
 
+    moveApprovedSourceMatches();
     cleanupSourceLinkFinderRejectedRows();
 
     const finderStats = getFinderProductRowStats_(finderSheet);
     const finderCapacity = Math.max(0, finderTarget - finderStats.activeProductRows);
     const runCapacity = Math.min(finderCapacity, batchLimit);
 
-    log_(logSheet, `Active product rows counted: ${finderStats.activeProductRows}`);
+    log_(logSheet, `Active rows after cleanup: ${finderStats.activeProductRows}`);
     log_(logSheet, `Source Link Finder target capacity: ${finderTarget}`);
     log_(logSheet, `Source Link Finder available slots: ${finderCapacity}`);
 
@@ -131,7 +132,11 @@ function moveSourceSearchQueueToSourceLinkFinder() {
     }
 
     const finderActiveBrandCounts = getActiveFinderBrandCounts_(finderSheet);
-    const finderAsins = getExistingAsins_(finderSheet);
+    const finderAsins = getExistingAsinsAcrossSheets_(ss, [
+      SHEETS.SOURCE_LINK_FINDER,
+      SHEETS.SOURCE_MATCHES,
+      SHEETS.SOURCE_LINK_FINDER_ARCHIVE
+    ]);
     const scanRows = Math.min(queueScanLimit, queueLastRow - 1);
     const queueColumnCount = queueSheet.getLastColumn();
     const finderColumnCount = finderSheet.getLastColumn();
@@ -190,7 +195,7 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
 /**
 * Archives Source Link Finder rows that are clearly rejected / complete.
-* Review and Yes decision rows remain active so they can be reviewed or matched.
+* Approved Yes rows are handled by moveApprovedSourceMatches().
 */
 function cleanupSourceLinkFinderRejectedRows() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
@@ -215,7 +220,7 @@ function cleanupSourceLinkFinderRejectedRows() {
 
   values.forEach((row, index) => {
     if (!rowHasProductIdentity_(row)) return;
-    if (!hasClearFinalRejectedDecision_(row)) return;
+    if (!hasRejectedMoveDecision_(row) && !hasClearFinalRejectedDecision_(row)) return;
 
     rowsToArchive.push(padRow_(row, sourceColumnCount));
     rowsToDelete.push(index + 2);
@@ -227,8 +232,8 @@ function cleanupSourceLinkFinderRejectedRows() {
   }
 
   const archiveSheet = getOrCreateSheet_(ss, SHEETS.SOURCE_LINK_FINDER_ARCHIVE);
-  ensureArchiveSheetColumns_(archiveSheet, sourceColumnCount);
-  ensureArchiveSheetHeaders_(finderSheet, archiveSheet, sourceColumnCount);
+  ensureSheetColumns_(archiveSheet, sourceColumnCount);
+  ensureDestinationSheetHeaders_(finderSheet, archiveSheet, sourceColumnCount);
 
   archiveSheet
     .getRange(archiveSheet.getLastRow() + 1, 1, rowsToArchive.length, sourceColumnCount)
@@ -239,6 +244,58 @@ function cleanupSourceLinkFinderRejectedRows() {
 
   log_(logSheet, `Rows archived from Source Link Finder: ${rowsToArchive.length}`);
   return rowsToArchive.length;
+}
+
+/**
+* Moves approved Source Link Finder rows into Source Matches.
+*/
+function moveApprovedSourceMatches() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
+  const finderSheet = ss.getSheetByName(SHEETS.SOURCE_LINK_FINDER);
+
+  if (!finderSheet) {
+    throw new Error('Source Link Finder tab not found.');
+  }
+
+  const lastRow = finderSheet.getLastRow();
+  const sourceColumnCount = finderSheet.getLastColumn();
+
+  if (lastRow < 2 || sourceColumnCount < 1) {
+    log_(logSheet, 'Rows moved to Source Matches: 0');
+    return 0;
+  }
+
+  const values = finderSheet.getRange(2, 1, lastRow - 1, sourceColumnCount).getValues();
+  const rowsToMove = [];
+  const rowsToDelete = [];
+
+  values.forEach((row, index) => {
+    if (!rowHasProductIdentity_(row)) return;
+    if (!hasApprovedMoveDecision_(row)) return;
+
+    rowsToMove.push(padRow_(row, sourceColumnCount));
+    rowsToDelete.push(index + 2);
+  });
+
+  if (!rowsToMove.length) {
+    log_(logSheet, 'Rows moved to Source Matches: 0');
+    return 0;
+  }
+
+  const matchesSheet = getOrCreateSheet_(ss, SHEETS.SOURCE_MATCHES);
+  ensureSheetColumns_(matchesSheet, sourceColumnCount);
+  ensureDestinationSheetHeaders_(finderSheet, matchesSheet, sourceColumnCount);
+
+  matchesSheet
+    .getRange(matchesSheet.getLastRow() + 1, 1, rowsToMove.length, sourceColumnCount)
+    .setValues(rowsToMove);
+
+  deleteRowsBottomUp_(finderSheet, rowsToDelete);
+  SpreadsheetApp.flush();
+
+  log_(logSheet, `Rows moved to Source Matches: ${rowsToMove.length}`);
+  return rowsToMove.length;
 }
 
 /**
@@ -276,6 +333,8 @@ function runSerpApiSourceFinder() {
     const cap = Math.min(remainingDaily, remainingMonthly);
 
     if (cap <= 0) {
+      moveApprovedSourceMatches();
+      cleanupSourceLinkFinderRejectedRows();
       log_(logSheet, `SerpApi cap reached. Today: ${usage.today}/${dailyCap}, Month: ${usage.month}/${monthlyCap}`);
       return;
     }
@@ -283,16 +342,23 @@ function runSerpApiSourceFinder() {
     const rows = getSerpApiCandidateRows_(sheet, cap);
 
     if (!rows.length) {
+      moveApprovedSourceMatches();
+      cleanupSourceLinkFinderRejectedRows();
       log_(logSheet, 'No eligible SerpApi rows ready to search.');
       return;
     }
 
     log_(logSheet, `Processing ${rows.length} SerpApi candidate rows`);
 
+    let autoApproved = 0;
+    let autoRejected = 0;
+
     rows.forEach(rowObj => {
       try {
-        processSerpApiRow_(sheet, rowObj, serpApiKey);
-        log_(logSheet, `SERPAPI_SEARCH row ${rowObj.rowNumber}: ${rowObj.asin} - completed`);
+        const result = processSerpApiRow_(sheet, rowObj, serpApiKey);
+        if (result.decision === 'Yes') autoApproved++;
+        if (result.decision === 'No') autoRejected++;
+        log_(logSheet, `SERPAPI_SEARCH row ${rowObj.rowNumber}: ${rowObj.asin} - completed with ${result.decision}`);
         Utilities.sleep(1200);
       } catch (err) {
         writeSerpApiError_(sheet, rowObj.rowNumber, err.message);
@@ -302,6 +368,10 @@ function runSerpApiSourceFinder() {
     });
 
     SpreadsheetApp.flush();
+    log_(logSheet, `Rows auto-approved Yes: ${autoApproved}`);
+    log_(logSheet, `Rows auto-rejected No: ${autoRejected}`);
+    moveApprovedSourceMatches();
+    cleanupSourceLinkFinderRejectedRows();
     log_(logSheet, 'Completed SerpApi Source Finder batch');
 
   } catch (err) {
@@ -483,12 +553,12 @@ function processSerpApiRow_(sheet, rowObj, apiKey) {
       'No clean source found',
       '',
       '',
-      'Low',
-      'Review',
-      'SerpApi searched; no clean source result under max buy cost.'
+      'Reject',
+      'No',
+      'No credible profitable source found under max buy cost.'
     ]]);
 
-    return;
+    return { decision: 'No' };
   }
 
   const profitCheck = best.price <= rowObj.maxBuyCost ? 'Under Max Buy Cost' : 'Above Max Buy Cost';
@@ -516,21 +586,29 @@ function processSerpApiRow_(sheet, rowObj, apiKey) {
       best.price,
       best.matchConfidence,
       'Yes',
-      `SerpApi found likely profitable match. ${best.notes}`
+      `Auto-approved clean profitable source. ${best.notes}`
     ]]);
-  } else {
-    const moveStatus = best.price <= rowObj.maxBuyCost ? 'Review' : 'No';
-    const confidence = best.price <= rowObj.maxBuyCost ? best.matchConfidence : 'Reject';
 
-    sheet.getRange(rowObj.rowNumber, 15, 1, 6).setValues([[
-      best.source || 'Source result reviewed',
-      best.link || '',
-      best.price || '',
-      confidence,
-      moveStatus,
-      `SerpApi result ${profitCheck}. ${best.notes}`
-    ]]);
+    return { decision: 'Yes' };
   }
+
+  const isAmbiguousPromising = isPromisingButIncomplete_(best, rowObj);
+  const moveStatus = isAmbiguousPromising ? 'Review' : 'No';
+  const confidence = moveStatus === 'Review' ? best.matchConfidence : 'Reject';
+  const notes = moveStatus === 'Review'
+    ? `Ambiguous but promising; data incomplete. ${best.notes}`
+    : buildAutoRejectNotes_(best, rowObj, profitCheck);
+
+  sheet.getRange(rowObj.rowNumber, 15, 1, 6).setValues([[
+    best.source || 'Source result reviewed',
+    best.link || '',
+    best.price || '',
+    confidence,
+    moveStatus,
+    notes
+  ]]);
+
+  return { decision: moveStatus };
 }
 
 function searchGoogleShopping_(query, apiKey) {
@@ -655,11 +733,41 @@ function isRiskyProduct_(title, brand) {
   return /amazon fire|fire 7|iphone|renewed|refurb|locked|software|download|turbotax|coin|commemorative/.test(t);
 }
 
+
+function isPromisingButIncomplete_(best, rowObj) {
+  if (best.price > rowObj.maxBuyCost) return false;
+  if (isRiskySource_(best.source) || isRiskyProduct_(rowObj.title, rowObj.brand)) return false;
+
+  const hasIncompleteIdentity = !rowObj.upc || !rowObj.brand || !rowObj.title;
+  return hasIncompleteIdentity && best.matchConfidence === 'Low';
+}
+
+function buildAutoRejectNotes_(best, rowObj, profitCheck) {
+  const reasons = [];
+
+  if (best.price > rowObj.maxBuyCost) reasons.push('above max buy cost');
+  if (best.matchConfidence === 'Low') reasons.push('low match confidence');
+  if (isRiskySource_(best.source)) reasons.push('risky source');
+  if (isRiskyProduct_(rowObj.title, rowObj.brand)) reasons.push('risky product');
+
+  const reasonText = reasons.length ? reasons.join(', ') : 'not a credible profitable source';
+  return `Auto-rejected: ${reasonText}. ${profitCheck}.`;
+}
+
 function writeSerpApiError_(sheet, rowNumber, message) {
   const now = new Date();
+  const conciseMessage = String(message || '').slice(0, 180);
 
+  sheet.getRange(rowNumber, 15, 1, 6).setValues([[
+    'Source search error',
+    '',
+    '',
+    'Reject',
+    'No',
+    `Auto-rejected: SerpApi error. ${conciseMessage}`
+  ]]);
   sheet.getRange(rowNumber, 23).setValue('Error'); // W, may be overwritten by formula if setup is rerun
-  sheet.getRange(rowNumber, 29).setValue(`SerpApi error: ${message}`); // AC
+  sheet.getRange(rowNumber, 29).setValue(`SerpApi error: ${conciseMessage}`); // AC
   sheet.getRange(rowNumber, 30).setValue(now); // AD
 }
 
@@ -859,6 +967,19 @@ function getExistingAsins_(sheet) {
   return set;
 }
 
+function getExistingAsinsAcrossSheets_(ss, sheetNames) {
+  const set = new Set();
+
+  sheetNames.forEach(sheetName => {
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return;
+
+    getExistingAsins_(sheet).forEach(asin => set.add(asin));
+  });
+
+  return set;
+}
+
 function buildKeepaRow_(product) {
   const asin = product.asin || '';
   const stats = product.stats || {};
@@ -982,7 +1103,7 @@ function getFinderProductRowStats_(sheet) {
 
   values.forEach((row, index) => {
     const rowNumber = index + 2;
-    if (rowHasProductIdentity_(row) && !hasClearFinalRejectedDecision_(row)) {
+    if (rowHasProductIdentity_(row) && !hasApprovedMoveDecision_(row) && !hasRejectedMoveDecision_(row) && !hasClearFinalRejectedDecision_(row)) {
       stats.activeProductRows++;
     } else if (!rowHasProductIdentity_(row)) {
       stats.emptyProductRows.push(rowNumber);
@@ -1012,7 +1133,7 @@ function getActiveFinderBrandCounts_(sheet) {
 
   values.forEach(row => {
     if (!rowHasProductIdentity_(row)) return;
-    if (hasClearFinalRejectedDecision_(row)) return;
+    if (hasApprovedMoveDecision_(row) || hasRejectedMoveDecision_(row) || hasClearFinalRejectedDecision_(row)) return;
 
     const brandKey = normalizeBrandKey_(row[3]);
     counts[brandKey] = (counts[brandKey] || 0) + 1;
@@ -1023,6 +1144,14 @@ function getActiveFinderBrandCounts_(sheet) {
 
 function rowHasProductIdentity_(row) {
   return Boolean(String(row[1] || '').trim() || String(row[2] || '').trim());
+}
+
+function hasApprovedMoveDecision_(row) {
+  return normalize_(row[18]) === 'yes'; // S
+}
+
+function hasRejectedMoveDecision_(row) {
+  return normalize_(row[18]) === 'no'; // S
 }
 
 function hasClearFinalRejectedDecision_(row) {
@@ -1038,17 +1167,17 @@ function hasClearFinalRejectedDecision_(row) {
   return decisionCells.some(value => finalRejectedValues[normalize_(value)] === true);
 }
 
-function ensureArchiveSheetColumns_(archiveSheet, sourceColumnCount) {
-  if (archiveSheet.getMaxColumns() < sourceColumnCount) {
-    archiveSheet.insertColumnsAfter(archiveSheet.getMaxColumns(), sourceColumnCount - archiveSheet.getMaxColumns());
+function ensureSheetColumns_(sheet, sourceColumnCount) {
+  if (sheet.getMaxColumns() < sourceColumnCount) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), sourceColumnCount - sheet.getMaxColumns());
   }
 }
 
-function ensureArchiveSheetHeaders_(sourceSheet, archiveSheet, sourceColumnCount) {
-  if (archiveSheet.getLastRow() > 0) return;
+function ensureDestinationSheetHeaders_(sourceSheet, destinationSheet, sourceColumnCount) {
+  if (destinationSheet.getLastRow() > 0) return;
 
   const headers = sourceSheet.getRange(1, 1, 1, sourceColumnCount).getValues();
-  archiveSheet.getRange(1, 1, 1, sourceColumnCount).setValues(headers);
+  destinationSheet.getRange(1, 1, 1, sourceColumnCount).setValues(headers);
 }
 
 function normalizeBrandKey_(brand) {
