@@ -11,6 +11,7 @@ const SHEETS = {
   RUN_LOG: 'Run Log',
   DAILY_KEEPA_PULL: 'Daily Keepa Pull',
   SOURCE_LINK_FINDER: 'Source Link Finder',
+  SOURCE_SEARCH_QUEUE: 'Source Search Queue',
   SOURCE_MATCHES: 'Source Matches'
 };
 
@@ -79,6 +80,112 @@ function resetKeepaRotation() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
   log_(logSheet, 'Reset Keepa query page rotation to 0');
+}
+
+/**
+* Moves rows from Source Search Queue into Source Link Finder while preserving
+* Source Link Finder capacity and brand diversity.
+*/
+function moveSourceSearchQueueToSourceLinkFinder() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
+  const queueSheet = ss.getSheetByName(SHEETS.SOURCE_SEARCH_QUEUE);
+  const finderSheet = ss.getSheetByName(SHEETS.SOURCE_LINK_FINDER);
+
+  if (!queueSheet) {
+    throw new Error('Source Search Queue tab not found.');
+  }
+  if (!finderSheet) {
+    throw new Error('Source Link Finder tab not found.');
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  const finderTarget = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_TARGET', 500);
+  const maxPerBrand = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_MAX_PER_BRAND', 5);
+  const queueScanLimit = getPositiveIntegerProperty_(props, 'SOURCE_QUEUE_SCAN_LIMIT', 1000);
+  const batchLimit = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_BATCH_LIMIT', finderTarget);
+
+  try {
+    log_(logSheet, `Started Source Search Queue transfer. Finder target: ${finderTarget}, max per brand: ${maxPerBrand}, queue scan limit: ${queueScanLimit}`);
+
+    const finderLastRow = finderSheet.getLastRow();
+    const finderRowCount = Math.max(0, finderLastRow - 1);
+    const finderCapacity = Math.max(0, finderTarget - finderRowCount);
+    const runCapacity = Math.min(finderCapacity, batchLimit);
+
+    if (runCapacity <= 0) {
+      log_(logSheet, `Source Link Finder already at capacity (${finderRowCount}/${finderTarget}). Rows moved to Source Link Finder: 0`);
+      return;
+    }
+
+    const queueLastRow = queueSheet.getLastRow();
+    if (queueLastRow < 2) {
+      log_(logSheet, 'Source Search Queue is empty. Rows moved to Source Link Finder: 0');
+      return;
+    }
+
+    const finderActiveBrandCounts = getActiveFinderBrandCounts_(finderSheet);
+    const finderAsins = getExistingAsins_(finderSheet);
+    const scanRows = Math.min(queueScanLimit, queueLastRow - 1);
+    const queueColumnCount = queueSheet.getLastColumn();
+    const finderColumnCount = finderSheet.getLastColumn();
+    const writeColumnCount = Math.min(queueColumnCount, finderColumnCount);
+    const queueValues = queueSheet.getRange(2, 1, scanRows, queueColumnCount).getValues();
+
+    const rowsToMove = [];
+    const queueRowsToDelete = [];
+    const cappedBrandSkips = {};
+    let duplicateSkips = 0;
+
+    for (let i = 0; i < queueValues.length && rowsToMove.length < runCapacity; i++) {
+      const row = queueValues[i];
+      const asin = String(row[1] || '').trim();
+      const brandKey = normalizeBrandKey_(row[3]);
+      const currentBrandCount = finderActiveBrandCounts[brandKey] || 0;
+
+      if (asin && finderAsins.has(asin)) {
+        duplicateSkips++;
+        continue;
+      }
+
+      if (currentBrandCount >= maxPerBrand) {
+        cappedBrandSkips[brandKey] = (cappedBrandSkips[brandKey] || 0) + 1;
+        continue;
+      }
+
+      rowsToMove.push(padRow_(row.slice(0, writeColumnCount), finderColumnCount));
+      queueRowsToDelete.push(i + 2);
+      if (asin) finderAsins.add(asin);
+      finderActiveBrandCounts[brandKey] = currentBrandCount + 1;
+    }
+
+    if (rowsToMove.length) {
+      finderSheet.getRange(finderSheet.getLastRow() + 1, 1, rowsToMove.length, finderColumnCount).setValues(rowsToMove);
+      deleteRowsBottomUp_(queueSheet, queueRowsToDelete);
+    }
+
+    const skippedDueToBrandCap = Object.keys(cappedBrandSkips).reduce((sum, brand) => sum + cappedBrandSkips[brand], 0);
+    const topBrandsCapped = formatTopCappedBrands_(cappedBrandSkips);
+    const scanLimitReached = scanRows < (queueLastRow - 1) && rowsToMove.length < runCapacity;
+
+    SpreadsheetApp.flush();
+    log_(logSheet, `Rows moved to Source Link Finder: ${rowsToMove.length}`);
+    log_(logSheet, `Rows skipped due to brand cap: ${skippedDueToBrandCap}`);
+    log_(logSheet, `Top brands capped: ${topBrandsCapped || 'None'}`);
+    log_(logSheet, `Queue scan limit reached: ${scanLimitReached ? 'Yes' : 'No'} (${scanRows}/${queueLastRow - 1} rows scanned)`);
+    if (duplicateSkips) log_(logSheet, `Rows skipped due to existing ASIN dedupe: ${duplicateSkips}`);
+    log_(logSheet, 'Completed Source Search Queue transfer');
+  } catch (err) {
+    log_(logSheet, `ERROR Source Search Queue transfer: ${err.message}`);
+    throw err;
+  }
+}
+
+/**
+* Optional alias for queue refill triggers.
+*/
+function refillSourceLinkFinderFromQueue() {
+  moveSourceSearchQueueToSourceLinkFinder();
 }
 
 /**
@@ -799,6 +906,67 @@ function scoreOpportunity_(data) {
 /************************************************************
 * HELPERS
 ************************************************************/
+
+
+function getActiveFinderBrandCounts_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const counts = {};
+
+  if (lastRow < 2) return counts;
+
+  const columnCount = Math.min(Math.max(20, sheet.getLastColumn()), sheet.getMaxColumns());
+  const values = sheet.getRange(2, 1, lastRow - 1, columnCount).getValues();
+
+  values.forEach(row => {
+    if (!rowHasProductIdentity_(row)) return;
+    if (hasClearFinalNoOrReject_(row)) return;
+
+    const brandKey = normalizeBrandKey_(row[3]);
+    counts[brandKey] = (counts[brandKey] || 0) + 1;
+  });
+
+  return counts;
+}
+
+function rowHasProductIdentity_(row) {
+  return Boolean(row[1] || row[2] || row[3]);
+}
+
+function hasClearFinalNoOrReject_(row) {
+  const decisionCells = row.slice(14, 20); // O:T
+  return decisionCells.some(value => {
+    const normalized = normalize_(value);
+    return normalized === 'no' || normalized === 'reject';
+  });
+}
+
+function normalizeBrandKey_(brand) {
+  const normalized = normalize_(brand);
+  return normalized || '(blank brand)';
+}
+
+function getPositiveIntegerProperty_(props, key, defaultValue) {
+  const value = Number(props.getProperty(key) || defaultValue);
+  return value > 0 && isFinite(value) ? Math.floor(value) : defaultValue;
+}
+
+function padRow_(row, length) {
+  const output = row.slice(0, length);
+  while (output.length < length) output.push('');
+  return output;
+}
+
+function deleteRowsBottomUp_(sheet, rowNumbers) {
+  rowNumbers.slice().sort((a, b) => b - a).forEach(rowNumber => sheet.deleteRow(rowNumber));
+}
+
+function formatTopCappedBrands_(cappedBrandSkips) {
+  return Object.keys(cappedBrandSkips)
+    .sort((a, b) => cappedBrandSkips[b] - cappedBrandSkips[a])
+    .slice(0, 10)
+    .map(brand => `${brand}: ${cappedBrandSkips[brand]}`)
+    .join(', ');
+}
 
 function getScriptProperty_(key) {
   const value = PropertiesService.getScriptProperties().getProperty(key);
