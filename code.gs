@@ -100,7 +100,7 @@ function moveSourceSearchQueueToSourceLinkFinder() {
   }
 
   const props = PropertiesService.getScriptProperties();
-  const finderTarget = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_TARGET', 500);
+  const finderTarget = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_TARGET_ROWS', 500);
   const maxPerBrand = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_MAX_PER_BRAND', 5);
   const queueScanLimit = getPositiveIntegerProperty_(props, 'SOURCE_QUEUE_SCAN_LIMIT', 1000);
   const batchLimit = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_BATCH_LIMIT', finderTarget);
@@ -108,13 +108,16 @@ function moveSourceSearchQueueToSourceLinkFinder() {
   try {
     log_(logSheet, `Started Source Search Queue transfer. Finder target: ${finderTarget}, max per brand: ${maxPerBrand}, queue scan limit: ${queueScanLimit}`);
 
-    const finderLastRow = finderSheet.getLastRow();
-    const finderRowCount = Math.max(0, finderLastRow - 1);
-    const finderCapacity = Math.max(0, finderTarget - finderRowCount);
+    const finderStats = getFinderProductRowStats_(finderSheet);
+    const finderCapacity = Math.max(0, finderTarget - finderStats.activeProductRows);
     const runCapacity = Math.min(finderCapacity, batchLimit);
 
+    log_(logSheet, `Active product rows counted: ${finderStats.activeProductRows}`);
+    log_(logSheet, `Source Link Finder target capacity: ${finderTarget}`);
+    log_(logSheet, `Source Link Finder available slots: ${finderCapacity}`);
+
     if (runCapacity <= 0) {
-      log_(logSheet, `Source Link Finder already at capacity (${finderRowCount}/${finderTarget}). Rows moved to Source Link Finder: 0`);
+      log_(logSheet, `Source Link Finder already at capacity (${finderStats.activeProductRows}/${finderTarget}). Rows moved to Source Link Finder: 0`);
       return;
     }
 
@@ -160,7 +163,7 @@ function moveSourceSearchQueueToSourceLinkFinder() {
     }
 
     if (rowsToMove.length) {
-      finderSheet.getRange(finderSheet.getLastRow() + 1, 1, rowsToMove.length, finderColumnCount).setValues(rowsToMove);
+      writeRowsToFinderProductSlots_(finderSheet, rowsToMove, finderStats.emptyProductRows, finderColumnCount);
       deleteRowsBottomUp_(queueSheet, queueRowsToDelete);
     }
 
@@ -908,6 +911,39 @@ function scoreOpportunity_(data) {
 ************************************************************/
 
 
+function getFinderProductRowStats_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const stats = {
+    activeProductRows: 0,
+    emptyProductRows: []
+  };
+
+  if (lastRow < 2) return stats;
+
+  const columnCount = Math.min(Math.max(20, sheet.getLastColumn()), sheet.getMaxColumns());
+  const values = sheet.getRange(2, 1, lastRow - 1, columnCount).getValues();
+
+  values.forEach((row, index) => {
+    const rowNumber = index + 2;
+    if (rowHasProductIdentity_(row) && !hasClearFinalNoOrReject_(row)) {
+      stats.activeProductRows++;
+    } else if (!rowHasProductIdentity_(row)) {
+      stats.emptyProductRows.push(rowNumber);
+    }
+  });
+
+  return stats;
+}
+
+function writeRowsToFinderProductSlots_(sheet, rows, emptyProductRows, columnCount) {
+  let appendRow = sheet.getLastRow() + 1;
+
+  rows.forEach((row, index) => {
+    const targetRow = emptyProductRows[index] || appendRow++;
+    sheet.getRange(targetRow, 1, 1, columnCount).setValues([row]);
+  });
+}
+
 function getActiveFinderBrandCounts_(sheet) {
   const lastRow = sheet.getLastRow();
   const counts = {};
@@ -929,7 +965,7 @@ function getActiveFinderBrandCounts_(sheet) {
 }
 
 function rowHasProductIdentity_(row) {
-  return Boolean(row[1] || row[2] || row[3]);
+  return Boolean(String(row[1] || '').trim() || String(row[2] || '').trim());
 }
 
 function hasClearFinalNoOrReject_(row) {

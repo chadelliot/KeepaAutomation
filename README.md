@@ -16,6 +16,9 @@ This control only changes which queued rows are moved into `Source Link Finder`.
 | --- | ---: | --- |
 | `SOURCE_LINK_FINDER_MAX_PER_BRAND` | `5` | Maximum active rows from the same brand allowed in `Source Link Finder`. Increase this if you want deeper coverage for repeated brands; decrease it for broader brand diversity. |
 | `SOURCE_QUEUE_SCAN_LIMIT` | `1000` | Maximum number of `Source Search Queue` rows scanned per refill run. Increase this if the queue is very brand-heavy and the refill needs to look deeper to find uncapped brands; decrease it if runs are taking too long. |
+| `SOURCE_LINK_FINDER_TARGET_ROWS` | `500` | Target number of real product rows to keep in `Source Link Finder`; blank or formula-only rows do not count toward this capacity. |
+
+`SOURCE_LINK_FINDER_TARGET_ROWS` remains optional and defaults to `500`. If `SOURCE_LINK_FINDER_BATCH_LIMIT` is set, it still limits how many rows can move in one run.
 
 `SOURCE_LINK_FINDER_TARGET` remains optional and defaults to `500`. If `SOURCE_LINK_FINDER_BATCH_LIMIT` is set, it still limits how many rows can move in one run.
 
@@ -29,6 +32,7 @@ If a row's final status is ambiguous, it is counted as active. This conservative
 
 After running `moveSourceSearchQueueToSourceLinkFinder()` or its alias `refillSourceLinkFinderFromQueue()`, check `Run Log` for entries showing:
 
+- active product rows counted, target capacity, and available slots
 - rows moved to `Source Link Finder`
 - rows skipped due to brand cap
 - top capped brands
