@@ -11,6 +11,7 @@ const SHEETS = {
   RUN_LOG: 'Run Log',
   DAILY_KEEPA_PULL: 'Daily Keepa Pull',
   SOURCE_LINK_FINDER: 'Source Link Finder',
+  SOURCE_LINK_FINDER_ARCHIVE: 'Source Link Finder Archive',
   SOURCE_SEARCH_QUEUE: 'Source Search Queue',
   SOURCE_MATCHES: 'Source Matches'
 };
@@ -108,6 +109,8 @@ function moveSourceSearchQueueToSourceLinkFinder() {
   try {
     log_(logSheet, `Started Source Search Queue transfer. Finder target: ${finderTarget}, max per brand: ${maxPerBrand}, queue scan limit: ${queueScanLimit}`);
 
+    cleanupSourceLinkFinderRejectedRows();
+
     const finderStats = getFinderProductRowStats_(finderSheet);
     const finderCapacity = Math.max(0, finderTarget - finderStats.activeProductRows);
     const runCapacity = Math.min(finderCapacity, batchLimit);
@@ -182,6 +185,60 @@ function moveSourceSearchQueueToSourceLinkFinder() {
     log_(logSheet, `ERROR Source Search Queue transfer: ${err.message}`);
     throw err;
   }
+}
+
+
+/**
+* Archives Source Link Finder rows that are clearly rejected / complete.
+* Review and Yes decision rows remain active so they can be reviewed or matched.
+*/
+function cleanupSourceLinkFinderRejectedRows() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
+  const finderSheet = ss.getSheetByName(SHEETS.SOURCE_LINK_FINDER);
+
+  if (!finderSheet) {
+    throw new Error('Source Link Finder tab not found.');
+  }
+
+  const lastRow = finderSheet.getLastRow();
+  const sourceColumnCount = finderSheet.getLastColumn();
+
+  if (lastRow < 2 || sourceColumnCount < 1) {
+    log_(logSheet, 'Rows archived from Source Link Finder: 0');
+    return 0;
+  }
+
+  const values = finderSheet.getRange(2, 1, lastRow - 1, sourceColumnCount).getValues();
+  const rowsToArchive = [];
+  const rowsToDelete = [];
+
+  values.forEach((row, index) => {
+    if (!rowHasProductIdentity_(row)) return;
+    if (!hasClearFinalRejectedDecision_(row)) return;
+
+    rowsToArchive.push(padRow_(row, sourceColumnCount));
+    rowsToDelete.push(index + 2);
+  });
+
+  if (!rowsToArchive.length) {
+    log_(logSheet, 'Rows archived from Source Link Finder: 0');
+    return 0;
+  }
+
+  const archiveSheet = getOrCreateSheet_(ss, SHEETS.SOURCE_LINK_FINDER_ARCHIVE);
+  ensureArchiveSheetColumns_(archiveSheet, sourceColumnCount);
+  ensureArchiveSheetHeaders_(finderSheet, archiveSheet, sourceColumnCount);
+
+  archiveSheet
+    .getRange(archiveSheet.getLastRow() + 1, 1, rowsToArchive.length, sourceColumnCount)
+    .setValues(rowsToArchive);
+
+  deleteRowsBottomUp_(finderSheet, rowsToDelete);
+  SpreadsheetApp.flush();
+
+  log_(logSheet, `Rows archived from Source Link Finder: ${rowsToArchive.length}`);
+  return rowsToArchive.length;
 }
 
 /**
@@ -925,7 +982,7 @@ function getFinderProductRowStats_(sheet) {
 
   values.forEach((row, index) => {
     const rowNumber = index + 2;
-    if (rowHasProductIdentity_(row) && !hasClearFinalNoOrReject_(row)) {
+    if (rowHasProductIdentity_(row) && !hasClearFinalRejectedDecision_(row)) {
       stats.activeProductRows++;
     } else if (!rowHasProductIdentity_(row)) {
       stats.emptyProductRows.push(rowNumber);
@@ -955,7 +1012,7 @@ function getActiveFinderBrandCounts_(sheet) {
 
   values.forEach(row => {
     if (!rowHasProductIdentity_(row)) return;
-    if (hasClearFinalNoOrReject_(row)) return;
+    if (hasClearFinalRejectedDecision_(row)) return;
 
     const brandKey = normalizeBrandKey_(row[3]);
     counts[brandKey] = (counts[brandKey] || 0) + 1;
@@ -968,12 +1025,30 @@ function rowHasProductIdentity_(row) {
   return Boolean(String(row[1] || '').trim() || String(row[2] || '').trim());
 }
 
-function hasClearFinalNoOrReject_(row) {
+function hasClearFinalRejectedDecision_(row) {
+  const finalRejectedValues = {
+    no: true,
+    reject: true,
+    rejected: true,
+    skip: true,
+    'not viable': true
+  };
   const decisionCells = row.slice(14, 20); // O:T
-  return decisionCells.some(value => {
-    const normalized = normalize_(value);
-    return normalized === 'no' || normalized === 'reject';
-  });
+
+  return decisionCells.some(value => finalRejectedValues[normalize_(value)] === true);
+}
+
+function ensureArchiveSheetColumns_(archiveSheet, sourceColumnCount) {
+  if (archiveSheet.getMaxColumns() < sourceColumnCount) {
+    archiveSheet.insertColumnsAfter(archiveSheet.getMaxColumns(), sourceColumnCount - archiveSheet.getMaxColumns());
+  }
+}
+
+function ensureArchiveSheetHeaders_(sourceSheet, archiveSheet, sourceColumnCount) {
+  if (archiveSheet.getLastRow() > 0) return;
+
+  const headers = sourceSheet.getRange(1, 1, 1, sourceColumnCount).getValues();
+  archiveSheet.getRange(1, 1, 1, sourceColumnCount).setValues(headers);
 }
 
 function normalizeBrandKey_(brand) {
