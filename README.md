@@ -43,10 +43,21 @@ Rows marked `Yes` are moved to `Source Matches`; rows marked `No`, `Reject`, `Sk
 | `Velocity Signal` | Sales velocity context from monthly sales and sales-rank drops when available. |
 | `Match Signal` | UPC, brand, title-overlap, retailer-legitimacy, and product-risk summary. |
 
+
+## Daily Keepa Pull brand diversity
+
+`runKeepaHourlyScan()` now applies brand diversity during the Daily Keepa Pull ingestion stage. Keepa candidates are deduped by ASIN/UPC across the workbook before brand selection, screened for profitability, velocity, product-quality, and risk signals, then grouped by normalized brand so one brand cannot consume the whole hourly batch.
+
+Brand diversity is a discovery control only: it does **not** override profitability or velocity requirements. Weak products, products without a likely sell price / max-buy-cost potential, products below the estimated 15% margin or $2 profit thresholds when calculable, weak velocity candidates, gift cards, subscriptions, apps/downloads, renewed/refurbished electronics, and restricted/risky brands are skipped before any brand slot is consumed.
+
+If the current Keepa query page is dominated by brands that have already hit the per-run cap, the scanner can continue into deeper Keepa query pages until it appends the hourly target, reaches the diversity scan limit, or stops because Keepa/API behavior would require additional unexpected calls. Run Log entries include candidates fetched/evaluated, opportunity-filter passes, products appended, brand-cap skips, top capped brands, duplicate skips, weak/opportunity-filter skips, and whether deeper page scanning was used.
+
 ## Tuning script properties
 
 | Property | Default | Purpose |
 | --- | ---: | --- |
+| `KEEPA_MAX_NEW_PRODUCTS_PER_BRAND` | `5` | Maximum new Daily Keepa Pull products appended per normalized brand per Keepa scan run, after dedupe and opportunity filtering. |
+| `KEEPA_BRAND_DIVERSITY_SCAN_LIMIT` | `250` | Maximum Keepa candidates evaluated per run while searching deeper pages for qualified, diverse products. |
 | `SOURCE_LINK_FINDER_BATCH_LIMIT` | `100` | Maximum eligible rows moved from `Source Search Queue` into `Source Link Finder` per refill run. This is a per-run batch limit, not a total Source Link Finder cap. |
 | `SOURCE_QUEUE_SCAN_LIMIT` | `1000` | Maximum Source Search Queue rows scanned per refill run so brand-heavy queues do not scan forever. |
 | `SOURCE_LINK_FINDER_MAX_PER_BRAND` | `5` | Maximum active rows per brand in `Source Link Finder`; approved/rejected rows are moved/archived before brand counts are calculated. |
