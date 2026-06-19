@@ -1,0 +1,22 @@
+name: Deploy Apps Script
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - name: Write clasp auth
+        env:
+          CLASPRC_JSON: ${{secrets.CLASPRC_JSON}}
+        run: printf '%s' "$CLASPRC_JSON" > ~/.clasprc.json
+      - run: npx clasp push --force

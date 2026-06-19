@@ -1,0 +1,10 @@
+{
+  "name": "keepa-automation",
+  "private": true,
+  "scripts": {
+    "deploy:appscript": "clasp push --force"
+  },
+  "devDependencies": {
+    "@google/clasp": "latest"
+  }
+}

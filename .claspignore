@@ -1,0 +1,12 @@
+.git/**
+.github/**
+node_modules/**
+README.md
+package.json
+package-lock.json
+.claspignore
+.clasp.json
+!appsscript.json
+!*.gs
+!*.js
+!*.html

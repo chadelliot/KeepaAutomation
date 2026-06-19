@@ -20,6 +20,8 @@ This control only changes which queued rows are moved into `Source Link Finder`.
 
 `SOURCE_LINK_FINDER_TARGET_ROWS` remains optional and defaults to `500`. If `SOURCE_LINK_FINDER_BATCH_LIMIT` is set, it still limits how many rows can move in one run.
 
+`SOURCE_LINK_FINDER_TARGET` remains optional and defaults to `500`. If `SOURCE_LINK_FINDER_BATCH_LIMIT` is set, it still limits how many rows can move in one run.
+
 ### How skipped rows are handled
 
 Rows skipped because their brand is already capped are left in `Source Search Queue` for future runs. The script does not overwrite core product data for skipped rows. Once active rows for that brand in `Source Link Finder` receive a clear final `No` or `Reject` status in the O:T decision columns, future refill runs can move more rows for that brand.
