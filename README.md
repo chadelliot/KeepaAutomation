@@ -1,40 +1,72 @@
 # KeepaAutomation
 
-Automate product discovery for Hidden Gems LLC.
+Automate product discovery and sourcing for Hidden Gems LLC.
 
-## Source Link Finder brand diversity controls
+## Automated sourcing workflow
 
-The queue refill step moves products from `Source Search Queue` into `Source Link Finder` while keeping the current default `Source Link Finder` target at **500 rows**. To prevent one or two brands from crowding out everything else, the refill now enforces a per-brand active-row cap before moving more queue rows.
+The sourcing pipeline is designed to run without using `Source Link Finder` as a capped manual review queue:
 
-By default, no more than **5 active rows per brand** are kept in `Source Link Finder`. This improves sourcing diversity for brands such as Carhartt, EcoNour, PartyWoo, Ailun, Owala, Apple, and any other brand that may dominate the queue.
+`Daily Keepa Pull` → `Qualified 2,000` → `Source Search Queue` → `Source Link Finder` processing → winners to `Source Matches` → losers/errors to `Source Link Finder Archive`
 
-This control only changes which queued rows are moved into `Source Link Finder`. It does **not** call Keepa and does **not** increase Keepa API usage.
+Use `runAutomatedSourcingPipeline()` for the end-to-end sourcing pass. It runs these steps in order:
 
-### New script properties
+1. `moveApprovedSourceMatches()` moves rows where column S is `Yes` from `Source Link Finder` to `Source Matches`.
+2. `cleanupSourceLinkFinderRejectedRows()` archives rejected, skipped, not-viable, or stale review rows.
+3. `moveSourceSearchQueueToSourceLinkFinder()` moves the next eligible batch from `Source Search Queue` into `Source Link Finder`.
+4. `runSerpApiSourceFinder()` searches eligible rows and writes final decisions into columns O:T.
+5. `moveApprovedSourceMatches()` moves newly approved winners to `Source Matches`.
+6. `cleanupSourceLinkFinderRejectedRows()` archives newly rejected losers and errors.
+
+`Source Link Finder` is a temporary processing workspace. It is **not** capped by total row count and should not be treated as a manual review queue.
+
+## Automated decisions
+
+SerpApi processing writes decisions into columns O:T for every searched row:
+
+- High-confidence profitable source matches are marked `Yes`.
+- Medium-confidence profitable source matches are marked `Yes`.
+- Low-confidence matches are marked `No` unless the row is promising but missing enough data to justify a short `Review` hold.
+- No source found, source price above Max Buy Cost, risky sources, risky products, gift cards, subscriptions, renewed/refurbished electronics, and Amazon-to-Amazon resale are marked `No`.
+- Search errors are marked `No` with concise notes so O:T is not left blank.
+
+Rows marked `Yes` are moved to `Source Matches`; rows marked `No`, `Reject`, `Skip`, `Not viable`, or other clear final rejected decisions are preserved in `Source Link Finder Archive` and deleted from the processing workspace.
+
+## Opportunity scoring columns
+
+`setupSerpApiColumns()` adds or repairs the SerpApi and opportunity columns on `Source Link Finder`:
+
+| Column | Purpose |
+| --- | --- |
+| `Opportunity Score` | 0-100 sourcing score based on profit, margin, velocity, match quality, and retailer/product risk. |
+| `Profit Signal` | Expected-profit threshold signal, including whether expected profit is at least $2. |
+| `Margin Signal` | Margin threshold signal, including whether margin is at least 15%. |
+| `Velocity Signal` | Sales velocity context from monthly sales and sales-rank drops when available. |
+| `Match Signal` | UPC, brand, title-overlap, retailer-legitimacy, and product-risk summary. |
+
+## Tuning script properties
 
 | Property | Default | Purpose |
 | --- | ---: | --- |
-| `SOURCE_LINK_FINDER_MAX_PER_BRAND` | `5` | Maximum active rows from the same brand allowed in `Source Link Finder`. Increase this if you want deeper coverage for repeated brands; decrease it for broader brand diversity. |
-| `SOURCE_QUEUE_SCAN_LIMIT` | `1000` | Maximum number of `Source Search Queue` rows scanned per refill run. Increase this if the queue is very brand-heavy and the refill needs to look deeper to find uncapped brands; decrease it if runs are taking too long. |
-| `SOURCE_LINK_FINDER_TARGET_ROWS` | `500` | Target number of real product rows to keep in `Source Link Finder`; blank or formula-only rows do not count toward this capacity. |
+| `SOURCE_LINK_FINDER_BATCH_LIMIT` | `100` | Maximum eligible rows moved from `Source Search Queue` into `Source Link Finder` per refill run. This is a per-run batch limit, not a total Source Link Finder cap. |
+| `SOURCE_QUEUE_SCAN_LIMIT` | `1000` | Maximum Source Search Queue rows scanned per refill run so brand-heavy queues do not scan forever. |
+| `SOURCE_LINK_FINDER_MAX_PER_BRAND` | `5` | Maximum active rows per brand in `Source Link Finder`; approved/rejected rows are moved/archived before brand counts are calculated. |
+| `SOURCE_REVIEW_MAX_AGE_DAYS` | `2` | Maximum age for rare `Review` rows before cleanup archives them unless they are marked `Yes`. |
+| `SERPAPI_DAILY_CAP` | `8` | Maximum SerpApi searches per day. |
+| `SERPAPI_MONTHLY_CAP` | `240` | Maximum SerpApi searches per month. |
 
-`SOURCE_LINK_FINDER_TARGET_ROWS` remains optional and defaults to `500`. If `SOURCE_LINK_FINDER_BATCH_LIMIT` is set, it still limits how many rows can move in one run.
+`SOURCE_LINK_FINDER_TARGET_ROWS` is no longer used. Total `Source Link Finder` row count does not block refills or processing.
 
-`SOURCE_LINK_FINDER_TARGET` remains optional and defaults to `500`. If `SOURCE_LINK_FINDER_BATCH_LIMIT` is set, it still limits how many rows can move in one run.
+## Run Log verification
 
-### How skipped rows are handled
+Check `Run Log` after `runAutomatedSourcingPipeline()` or individual steps. Expected entries include:
 
-Rows skipped because their brand is already capped are left in `Source Search Queue` for future runs. The script does not overwrite core product data for skipped rows. Once active rows for that brand in `Source Link Finder` receive a clear final `No` or `Reject` status in the O:T decision columns, future refill runs can move more rows for that brand.
-
-If a row's final status is ambiguous, it is counted as active. This conservative behavior prevents uncertain rows from bypassing the brand cap.
-
-### Run Log verification
-
-After running `moveSourceSearchQueueToSourceLinkFinder()` or its alias `refillSourceLinkFinderFromQueue()`, check `Run Log` for entries showing:
-
-- active product rows counted, target capacity, and available slots
-- rows moved to `Source Link Finder`
-- rows skipped due to brand cap
-- top capped brands
-- whether the queue scan limit was reached
-- any duplicate ASIN skips from existing dedupe behavior
+- rows moved into `Source Link Finder`
+- rows searched
+- rows auto-approved `Yes`
+- rows auto-rejected `No`
+- rows left `Review`
+- rows moved to `Source Matches`
+- rows archived
+- brand-cap skips
+- duplicate ASIN/UPC skips
+- errors or retry/rejection notes

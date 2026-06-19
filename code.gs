@@ -84,8 +84,25 @@ function resetKeepaRotation() {
 }
 
 /**
+* Runs the automated sourcing workflow end-to-end.
+*/
+function runAutomatedSourcingPipeline() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
+
+  log_(logSheet, 'Started automated sourcing pipeline');
+  moveApprovedSourceMatches();
+  cleanupSourceLinkFinderRejectedRows();
+  moveSourceSearchQueueToSourceLinkFinder();
+  runSerpApiSourceFinder();
+  moveApprovedSourceMatches();
+  cleanupSourceLinkFinderRejectedRows();
+  log_(logSheet, 'Completed automated sourcing pipeline');
+}
+
+/**
 * Moves rows from Source Search Queue into Source Link Finder while preserving
-* Source Link Finder capacity and brand diversity.
+* brand diversity and ASIN dedupe.
 */
 function moveSourceSearchQueueToSourceLinkFinder() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
@@ -101,29 +118,19 @@ function moveSourceSearchQueueToSourceLinkFinder() {
   }
 
   const props = PropertiesService.getScriptProperties();
-  const finderTarget = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_TARGET_ROWS', 500);
   const maxPerBrand = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_MAX_PER_BRAND', 5);
   const queueScanLimit = getPositiveIntegerProperty_(props, 'SOURCE_QUEUE_SCAN_LIMIT', 1000);
-  const batchLimit = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_BATCH_LIMIT', finderTarget);
+  const batchLimit = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_BATCH_LIMIT', 100);
 
   try {
-    log_(logSheet, `Started Source Search Queue transfer. Finder target: ${finderTarget}, max per brand: ${maxPerBrand}, queue scan limit: ${queueScanLimit}`);
+    log_(logSheet, `Started Source Search Queue transfer. Max per brand: ${maxPerBrand}, batch limit: ${batchLimit}, queue scan limit: ${queueScanLimit}`);
 
     moveApprovedSourceMatches();
     cleanupSourceLinkFinderRejectedRows();
 
     const finderStats = getFinderProductRowStats_(finderSheet);
-    const finderCapacity = Math.max(0, finderTarget - finderStats.activeProductRows);
-    const runCapacity = Math.min(finderCapacity, batchLimit);
 
     log_(logSheet, `Active rows after cleanup: ${finderStats.activeProductRows}`);
-    log_(logSheet, `Source Link Finder target capacity: ${finderTarget}`);
-    log_(logSheet, `Source Link Finder available slots: ${finderCapacity}`);
-
-    if (runCapacity <= 0) {
-      log_(logSheet, `Source Link Finder already at capacity (${finderStats.activeProductRows}/${finderTarget}). Rows moved to Source Link Finder: 0`);
-      return;
-    }
 
     const queueLastRow = queueSheet.getLastRow();
     if (queueLastRow < 2) {
@@ -132,7 +139,7 @@ function moveSourceSearchQueueToSourceLinkFinder() {
     }
 
     const finderActiveBrandCounts = getActiveFinderBrandCounts_(finderSheet);
-    const finderAsins = getExistingAsinsAcrossSheets_(ss, [
+    const existingProductKeys = getExistingProductKeysAcrossSheets_(ss, [
       SHEETS.SOURCE_LINK_FINDER,
       SHEETS.SOURCE_MATCHES,
       SHEETS.SOURCE_LINK_FINDER_ARCHIVE
@@ -148,13 +155,14 @@ function moveSourceSearchQueueToSourceLinkFinder() {
     const cappedBrandSkips = {};
     let duplicateSkips = 0;
 
-    for (let i = 0; i < queueValues.length && rowsToMove.length < runCapacity; i++) {
+    for (let i = 0; i < queueValues.length && rowsToMove.length < batchLimit; i++) {
       const row = queueValues[i];
       const asin = String(row[1] || '').trim();
+      const upc = String(row[4] || '').trim();
       const brandKey = normalizeBrandKey_(row[3]);
       const currentBrandCount = finderActiveBrandCounts[brandKey] || 0;
 
-      if (asin && finderAsins.has(asin)) {
+      if ((asin && existingProductKeys.asins.has(asin)) || (upc && existingProductKeys.upcs.has(upc))) {
         duplicateSkips++;
         continue;
       }
@@ -166,7 +174,8 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
       rowsToMove.push(padRow_(row.slice(0, writeColumnCount), finderColumnCount));
       queueRowsToDelete.push(i + 2);
-      if (asin) finderAsins.add(asin);
+      if (asin) existingProductKeys.asins.add(asin);
+      if (upc) existingProductKeys.upcs.add(upc);
       finderActiveBrandCounts[brandKey] = currentBrandCount + 1;
     }
 
@@ -177,7 +186,7 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
     const skippedDueToBrandCap = Object.keys(cappedBrandSkips).reduce((sum, brand) => sum + cappedBrandSkips[brand], 0);
     const topBrandsCapped = formatTopCappedBrands_(cappedBrandSkips);
-    const scanLimitReached = scanRows < (queueLastRow - 1) && rowsToMove.length < runCapacity;
+    const scanLimitReached = scanRows < (queueLastRow - 1);
 
     SpreadsheetApp.flush();
     log_(logSheet, `Rows moved to Source Link Finder: ${rowsToMove.length}`);
@@ -206,6 +215,8 @@ function cleanupSourceLinkFinderRejectedRows() {
     throw new Error('Source Link Finder tab not found.');
   }
 
+  const props = PropertiesService.getScriptProperties();
+  const reviewMaxAgeDays = getPositiveIntegerProperty_(props, 'SOURCE_REVIEW_MAX_AGE_DAYS', 2);
   const lastRow = finderSheet.getLastRow();
   const sourceColumnCount = finderSheet.getLastColumn();
 
@@ -220,7 +231,7 @@ function cleanupSourceLinkFinderRejectedRows() {
 
   values.forEach((row, index) => {
     if (!rowHasProductIdentity_(row)) return;
-    if (!hasRejectedMoveDecision_(row) && !hasClearFinalRejectedDecision_(row)) return;
+    if (!hasRejectedMoveDecision_(row) && !hasClearFinalRejectedDecision_(row) && !hasStaleReviewDecision_(row, reviewMaxAgeDays)) return;
 
     rowsToArchive.push(padRow_(row, sourceColumnCount));
     rowsToDelete.push(index + 2);
@@ -321,6 +332,7 @@ function runSerpApiSourceFinder() {
 
   try {
     log_(logSheet, 'Started SerpApi Source Finder batch');
+    ensureOpportunityScoringColumns_(sheet);
 
     const serpApiKey = getScriptProperty_('SERPAPI_API_KEY');
     const dailyCap = Number(PropertiesService.getScriptProperties().getProperty('SERPAPI_DAILY_CAP') || 8);
@@ -352,16 +364,19 @@ function runSerpApiSourceFinder() {
 
     let autoApproved = 0;
     let autoRejected = 0;
+    let leftReview = 0;
 
     rows.forEach(rowObj => {
       try {
         const result = processSerpApiRow_(sheet, rowObj, serpApiKey);
         if (result.decision === 'Yes') autoApproved++;
         if (result.decision === 'No') autoRejected++;
+        if (result.decision === 'Review') leftReview++;
         log_(logSheet, `SERPAPI_SEARCH row ${rowObj.rowNumber}: ${rowObj.asin} - completed with ${result.decision}`);
         Utilities.sleep(1200);
       } catch (err) {
         writeSerpApiError_(sheet, rowObj.rowNumber, err.message);
+        autoRejected++;
         log_(logSheet, `SERPAPI_ERROR row ${rowObj.rowNumber}: ${rowObj.asin} - ${err.message}`);
         Utilities.sleep(1200);
       }
@@ -370,6 +385,7 @@ function runSerpApiSourceFinder() {
     SpreadsheetApp.flush();
     log_(logSheet, `Rows auto-approved Yes: ${autoApproved}`);
     log_(logSheet, `Rows auto-rejected No: ${autoRejected}`);
+    log_(logSheet, `Rows left Review: ${leftReview}`);
     moveApprovedSourceMatches();
     cleanupSourceLinkFinderRejectedRows();
     log_(logSheet, 'Completed SerpApi Source Finder batch');
@@ -413,7 +429,7 @@ function setupSerpApiColumns() {
     throw new Error('Source Link Finder tab not found.');
   }
 
-  const requiredColumnCount = 30;
+  const requiredColumnCount = 35;
   if (sheet.getMaxColumns() < requiredColumnCount) {
     sheet.insertColumnsAfter(sheet.getMaxColumns(), requiredColumnCount - sheet.getMaxColumns());
   }
@@ -428,7 +444,12 @@ function setupSerpApiColumns() {
     'SerpApi Best URL',
     'SerpApi Profit Check',
     'SerpApi Notes',
-    'Last SerpApi Check'
+    'Last SerpApi Check',
+    'Opportunity Score',
+    'Profit Signal',
+    'Margin Signal',
+    'Velocity Signal',
+    'Match Signal'
   ];
 
   sheet.getRange(1, 21, 1, headers.length).setValues([headers]);
@@ -445,7 +466,7 @@ function setupSerpApiColumns() {
     '=ARRAYFORMULA(IF(B2:B="","",IF(AD2:AD<>"","Searched",IF(V2:V="Yes","Ready","Skip"))))'
   );
 
-  const headerRange = sheet.getRange(1, 21, 1, 10);
+  const headerRange = sheet.getRange(1, 21, 1, headers.length);
   headerRange
     .setBackground('#0D1F38')
     .setFontColor('#FFFFFF')
@@ -454,6 +475,7 @@ function setupSerpApiColumns() {
     .setWrap(true);
 
   sheet.getRange('Z2:Z2500').setNumberFormat('$#,##0.00');
+  sheet.getRange('AE2:AE2500').setNumberFormat('0');
 
   const validation = SpreadsheetApp.newDataValidation()
     .requireValueInList(['Ready', 'Searched', 'Skip', 'Error'], true)
@@ -462,7 +484,7 @@ function setupSerpApiColumns() {
 
   sheet.getRange('W2:W2500').setDataValidation(validation);
 
-  sheet.autoResizeColumns(21, 10);
+  sheet.autoResizeColumns(21, headers.length);
 
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
   log_(logSheet, 'SerpApi columns repaired / installed on Source Link Finder.');
@@ -476,7 +498,7 @@ function getSerpApiCandidateRows_(sheet, cap) {
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
 
-  const range = sheet.getRange(2, 1, lastRow - 1, 30);
+  const range = sheet.getRange(2, 1, lastRow - 1, Math.max(35, sheet.getLastColumn()));
   const values = range.getValues();
 
   const candidates = [];
@@ -491,6 +513,8 @@ function getSerpApiCandidateRows_(sheet, cap) {
     const sellPrice = toNumber_(row[5]); // F
     const maxBuyCost = toNumber_(row[6]); // G
     const bestSearchQuery = row[8];   // I
+    const monthlySales = toNumber_(row[11]); // L
+    const salesRankDrops = toNumber_(row[13]); // N
     const moveToMatches = row[18];    // S
     const priorityScore = toNumber_(row[20]); // U
     const eligible = row[21];         // V
@@ -512,6 +536,8 @@ function getSerpApiCandidateRows_(sheet, cap) {
       upc,
       sellPrice,
       maxBuyCost,
+      monthlySales,
+      salesRankDrops,
       query: buildSerpApiQuery_(bestSearchQuery, upc, title, brand),
       priorityScore
     });
@@ -557,6 +583,7 @@ function processSerpApiRow_(sheet, rowObj, apiKey) {
       'No',
       'No credible profitable source found under max buy cost.'
     ]]);
+    writeOpportunitySignals_(sheet, rowObj.rowNumber, buildOpportunitySignals_(rowObj, null));
 
     return { decision: 'No' };
   }
@@ -572,6 +599,9 @@ function processSerpApiRow_(sheet, rowObj, apiKey) {
     best.notes,
     now
   ]]);
+
+  const opportunitySignals = buildOpportunitySignals_(rowObj, best);
+  writeOpportunitySignals_(sheet, rowObj.rowNumber, opportunitySignals);
 
   const isCleanProfitable =
     best.price <= rowObj.maxBuyCost &&
@@ -655,7 +685,8 @@ function pickBestShoppingResult_(shoppingResults, rowObj) {
 
       if (!price || !title) return null;
 
-      const matchScore = scoreShoppingMatch_(title, source, rowObj);
+      const matchSignals = getShoppingMatchSignals_(title, source, rowObj);
+      const matchScore = matchSignals.score;
       const priceScore = price <= rowObj.maxBuyCost ? 40 : 0;
       const sourcePenalty = isRiskySource_(source) ? -25 : 0;
       const totalScore = matchScore + priceScore + sourcePenalty;
@@ -680,6 +711,10 @@ function pickBestShoppingResult_(shoppingResults, rowObj) {
         matchScore,
         totalScore,
         matchConfidence,
+        upcMatched: matchSignals.upcMatched,
+        brandMatched: matchSignals.brandMatched,
+        titleOverlap: matchSignals.titleOverlap,
+        titleWordsChecked: matchSignals.titleWordsChecked,
         notes
       };
     })
@@ -691,16 +726,18 @@ function pickBestShoppingResult_(shoppingResults, rowObj) {
   return scored[0];
 }
 
-function scoreShoppingMatch_(resultTitle, source, rowObj) {
+function getShoppingMatchSignals_(resultTitle, source, rowObj) {
   const result = normalize_(resultTitle);
   const title = normalize_(rowObj.title);
   const brand = normalize_(rowObj.brand);
   const upc = normalize_(rowObj.upc);
 
   let score = 0;
+  const brandMatched = Boolean(brand && result.includes(brand));
+  const upcMatched = Boolean(upc && result.includes(upc));
 
-  if (brand && result.includes(brand)) score += 25;
-  if (upc && result.includes(upc)) score += 45;
+  if (brandMatched) score += 25;
+  if (upcMatched) score += 45;
 
   const titleWords = title
     .split(' ')
@@ -717,7 +754,17 @@ function scoreShoppingMatch_(resultTitle, source, rowObj) {
 
   if (source && !isRiskySource_(source)) score += 10;
 
-  return score;
+  return {
+    score,
+    upcMatched,
+    brandMatched,
+    titleOverlap: titleWords.length ? matchedWords / titleWords.length : 0,
+    titleWordsChecked: titleWords.length
+  };
+}
+
+function scoreShoppingMatch_(resultTitle, source, rowObj) {
+  return getShoppingMatchSignals_(resultTitle, source, rowObj).score;
 }
 
 function isRiskySource_(source) {
@@ -754,6 +801,85 @@ function buildAutoRejectNotes_(best, rowObj, profitCheck) {
   return `Auto-rejected: ${reasonText}. ${profitCheck}.`;
 }
 
+
+function buildOpportunitySignals_(rowObj, best) {
+  if (!best) {
+    return {
+      score: 0,
+      profitSignal: 'No source',
+      marginSignal: 'No source',
+      velocitySignal: buildVelocitySignal_(rowObj),
+      matchSignal: 'No credible match'
+    };
+  }
+
+  const expectedProfit = Math.max(0, rowObj.maxBuyCost - best.price);
+  const margin = best.price ? expectedProfit / best.price : 0;
+  const profitable = expectedProfit >= 2 && best.price <= rowObj.maxBuyCost;
+  const marginOk = margin >= 0.15;
+  const velocityScore = getVelocityScore_(rowObj);
+  const legitimateRetailer = !isRiskySource_(best.source);
+  const productAllowed = !isRiskyProduct_(rowObj.title, rowObj.brand);
+
+  let score = 0;
+  if (profitable) score += 25;
+  if (marginOk) score += 15;
+  score += velocityScore;
+  if (best.price <= rowObj.maxBuyCost) score += 15;
+  if (best.matchConfidence === 'High') score += 20;
+  else if (best.matchConfidence === 'Medium') score += 12;
+  if (best.upcMatched) score += 15;
+  if (best.brandMatched) score += 10;
+  score += Math.min(10, Math.round((best.titleOverlap || 0) * 10));
+  if (legitimateRetailer) score += 10;
+  if (!productAllowed) score -= 30;
+
+  return {
+    score: Math.max(0, Math.min(100, score)),
+    profitSignal: profitable ? `Profit >= $2 ($${expectedProfit.toFixed(2)})` : `Profit below threshold ($${expectedProfit.toFixed(2)})`,
+    marginSignal: marginOk ? `Margin ${(margin * 100).toFixed(0)}%` : `Margin below 15% (${(margin * 100).toFixed(0)}%)`,
+    velocitySignal: buildVelocitySignal_(rowObj),
+    matchSignal: buildMatchSignal_(best, legitimateRetailer, productAllowed)
+  };
+}
+
+function writeOpportunitySignals_(sheet, rowNumber, signals) {
+  ensureSheetColumns_(sheet, 35);
+  sheet.getRange(rowNumber, 31, 1, 5).setValues([[
+    signals.score,
+    signals.profitSignal,
+    signals.marginSignal,
+    signals.velocitySignal,
+    signals.matchSignal
+  ]]);
+}
+
+function getVelocityScore_(rowObj) {
+  const monthlySales = Number(rowObj.monthlySales || 0);
+  const salesRankDrops = Number(rowObj.salesRankDrops || 0);
+  return Math.min(15, Math.floor(monthlySales / 20) + Math.floor(salesRankDrops / 2));
+}
+
+function buildVelocitySignal_(rowObj) {
+  const monthlySales = Number(rowObj.monthlySales || 0);
+  const salesRankDrops = Number(rowObj.salesRankDrops || 0);
+  if (!monthlySales && !salesRankDrops) return 'No velocity data';
+  return `Monthly sales: ${monthlySales || 0}; rank drops: ${salesRankDrops || 0}`;
+}
+
+function buildMatchSignal_(best, legitimateRetailer, productAllowed) {
+  const parts = [
+    best.matchConfidence,
+    best.upcMatched ? 'UPC match' : 'UPC not confirmed',
+    best.brandMatched ? 'brand match' : 'brand not confirmed',
+    `title overlap ${Math.round((best.titleOverlap || 0) * 100)}%`,
+    legitimateRetailer ? 'legitimate retailer' : 'risky source',
+    productAllowed ? 'allowed product' : 'risky product'
+  ];
+
+  return parts.join('; ');
+}
+
 function writeSerpApiError_(sheet, rowNumber, message) {
   const now = new Date();
   const conciseMessage = String(message || '').slice(0, 180);
@@ -766,6 +892,13 @@ function writeSerpApiError_(sheet, rowNumber, message) {
     'No',
     `Auto-rejected: SerpApi error. ${conciseMessage}`
   ]]);
+  writeOpportunitySignals_(sheet, rowNumber, {
+    score: 0,
+    profitSignal: 'Search error',
+    marginSignal: 'Search error',
+    velocitySignal: 'Search error',
+    matchSignal: 'Search error'
+  });
   sheet.getRange(rowNumber, 23).setValue('Error'); // W, may be overwritten by formula if setup is rerun
   sheet.getRange(rowNumber, 29).setValue(`SerpApi error: ${conciseMessage}`); // AC
   sheet.getRange(rowNumber, 30).setValue(now); // AD
@@ -968,13 +1101,36 @@ function getExistingAsins_(sheet) {
 }
 
 function getExistingAsinsAcrossSheets_(ss, sheetNames) {
-  const set = new Set();
+  return getExistingProductKeysAcrossSheets_(ss, sheetNames).asins;
+}
+
+function getExistingProductKeysAcrossSheets_(ss, sheetNames) {
+  const keys = {
+    asins: new Set(),
+    upcs: new Set()
+  };
 
   sheetNames.forEach(sheetName => {
     const sheet = ss.getSheetByName(sheetName);
     if (!sheet) return;
 
-    getExistingAsins_(sheet).forEach(asin => set.add(asin));
+    getExistingAsins_(sheet).forEach(asin => keys.asins.add(asin));
+    getExistingUpcs_(sheet).forEach(upc => keys.upcs.add(upc));
+  });
+
+  return keys;
+}
+
+function getExistingUpcs_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const set = new Set();
+
+  if (lastRow < 2 || sheet.getLastColumn() < 5) return set;
+
+  const values = sheet.getRange(2, 5, lastRow - 1, 1).getValues();
+
+  values.forEach(row => {
+    if (row[0]) set.add(String(row[0]).trim());
   });
 
   return set;
@@ -1152,6 +1308,16 @@ function hasApprovedMoveDecision_(row) {
 
 function hasRejectedMoveDecision_(row) {
   return normalize_(row[18]) === 'no'; // S
+}
+
+function hasStaleReviewDecision_(row, reviewMaxAgeDays) {
+  if (normalize_(row[18]) !== 'review') return false;
+
+  const lastChecked = row[29]; // AD
+  if (!(lastChecked instanceof Date)) return false;
+
+  const ageMs = new Date().getTime() - lastChecked.getTime();
+  return ageMs > reviewMaxAgeDays * 24 * 60 * 60 * 1000;
 }
 
 function hasClearFinalRejectedDecision_(row) {
