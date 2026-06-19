@@ -231,7 +231,15 @@ function cleanupSourceLinkFinderRejectedRows() {
 
   values.forEach((row, index) => {
     if (!rowHasProductIdentity_(row)) return;
-    if (!hasRejectedMoveDecision_(row) && !hasClearFinalRejectedDecision_(row) && !hasStaleReviewDecision_(row, reviewMaxAgeDays)) return;
+    if (hasApprovedMoveDecision_(row)) return;
+
+    const shouldArchive =
+      hasRejectedMoveDecision_(row) ||
+      hasClearFinalRejectedDecision_(row) ||
+      (!hasReviewMoveDecision_(row) && hasSkipSearchStatus_(row)) ||
+      hasStaleReviewDecision_(row, reviewMaxAgeDays);
+
+    if (!shouldArchive) return;
 
     rowsToArchive.push(padRow_(row, sourceColumnCount));
     rowsToDelete.push(index + 2);
@@ -488,6 +496,24 @@ function setupSerpApiColumns() {
 
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
   log_(logSheet, 'SerpApi columns repaired / installed on Source Link Finder.');
+}
+
+function ensureOpportunityScoringColumns_(sheet) {
+  const requiredColumnCount = 35;
+  if (sheet.getMaxColumns() < requiredColumnCount) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), requiredColumnCount - sheet.getMaxColumns());
+  }
+
+  const headers = [
+    'Opportunity Score',
+    'Profit Signal',
+    'Margin Signal',
+    'Velocity Signal',
+    'Match Signal'
+  ];
+
+  sheet.getRange(1, 31, 1, headers.length).setValues([headers]);
+  sheet.getRange('AE2:AE2500').setNumberFormat('0');
 }
 
 /************************************************************
@@ -1308,6 +1334,14 @@ function hasApprovedMoveDecision_(row) {
 
 function hasRejectedMoveDecision_(row) {
   return normalize_(row[18]) === 'no'; // S
+}
+
+function hasReviewMoveDecision_(row) {
+  return normalize_(row[18]) === 'review'; // S
+}
+
+function hasSkipSearchStatus_(row) {
+  return normalize_(row[22]) === 'skip'; // W
 }
 
 function hasStaleReviewDecision_(row, reviewMaxAgeDays) {
