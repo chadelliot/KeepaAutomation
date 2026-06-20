@@ -47,6 +47,8 @@ function runKeepaHourlyScan() {
 
   let pagesScanned = 0;
   let candidatesFetched = 0;
+  let viableDiverseSelected = 0;
+  let scanStopReason = '';
   let nextPage = currentPage;
   const products = [];
 
@@ -59,7 +61,12 @@ function runKeepaHourlyScan() {
       log_(logSheet, `WARNING Keepa brand diversity scan would wrap past configured rotation pages (${requestedPagesToScan}/${maxPages}); stopping before repeated page/API calls.`);
     }
 
-    while (pagesScanned < maxPagesToScan && candidatesFetched < maxCandidatesToEvaluate && !tokenGuard.stopReason) {
+    while (
+      viableDiverseSelected < pageSize &&
+      pagesScanned < maxPagesToScan &&
+      candidatesFetched < maxCandidatesToEvaluate &&
+      !tokenGuard.stopReason
+    ) {
       const page = (currentPage + pagesScanned) % maxPages;
       let asins = [];
       try {
@@ -71,8 +78,6 @@ function runKeepaHourlyScan() {
         break;
       }
 
-      candidatesFetched += asins.length;
-
       log_(logSheet, `Fetched ${asins.length} ASINs from Keepa query page ${page}`);
 
       if (!asins.length) break;
@@ -81,8 +86,15 @@ function runKeepaHourlyScan() {
         break;
       }
 
-      const remainingEvaluationSlots = Math.max(0, maxCandidatesToEvaluate - (candidatesFetched - asins.length));
+      const remainingEvaluationSlots = Math.max(0, maxCandidatesToEvaluate - candidatesFetched);
       const asinsToFetch = asins.slice(0, remainingEvaluationSlots);
+      candidatesFetched += asinsToFetch.length;
+
+      if (!asinsToFetch.length) {
+        scanStopReason = 'scan limit reached';
+        break;
+      }
+
       let pageProducts = [];
       try {
         pageProducts = fetchKeepaProducts_(apiKey, asinsToFetch, tokenGuard);
@@ -100,19 +112,37 @@ function runKeepaHourlyScan() {
       nextPage = (page + 1) % maxPages;
 
       const preview = selectKeepaProductsForAppend_(ss, products, pageSize, props);
-      if (preview.rows.length >= pageSize) break;
+      viableDiverseSelected = preview.rows.length;
+      if (viableDiverseSelected >= pageSize) {
+        scanStopReason = 'target filled';
+        break;
+      }
       if (tokenGuard.stopReason) break;
 
-      if (pagesScanned >= maxPagesToScan && preview.rows.length < pageSize) {
-        log_(logSheet, `WARNING Keepa brand diversity scan limit reached before filling target: ${preview.rows.length}/${pageSize} qualified diverse products.`);
+      if (candidatesFetched >= maxCandidatesToEvaluate) {
+        scanStopReason = 'scan limit reached';
+        break;
       }
+    }
+
+    if (!scanStopReason) {
+      if (tokenGuard.stopReason) scanStopReason = 'token budget reached';
+      else if (viableDiverseSelected >= pageSize) scanStopReason = 'target filled';
+      else if (candidatesFetched >= maxCandidatesToEvaluate || pagesScanned >= maxPagesToScan) scanStopReason = 'scan limit reached';
+      else scanStopReason = 'no more Keepa candidates';
+    }
+
+    if (scanStopReason === 'scan limit reached' && viableDiverseSelected < pageSize) {
+      log_(logSheet, `WARNING Keepa brand diversity scan limit reached before filling target: ${viableDiverseSelected}/${pageSize} viable diverse products.`);
     }
 
     props.setProperty('KEEPA_QUERY_PAGE', String(nextPage));
 
     if (!products.length) {
+      log_(logSheet, `Keepa pages scanned: ${pagesScanned}`);
       log_(logSheet, `Keepa candidates fetched: ${candidatesFetched}`);
       log_(logSheet, `Token-limit stop/warning: ${tokenGuard.stopReason || 'None'}${tokenGuard.tokensLeft !== null ? ` (tokens left: ${tokenGuard.tokensLeft})` : ''}`);
+      log_(logSheet, `Keepa scan stop reason: ${scanStopReason}`);
       log_(logSheet, tokenGuard.stopReason ? 'No products appended because Keepa token/API guard stopped before product details were available.' : 'No ASINs returned. Check Keepa Product Finder filters or KEEPA_SELECTION_JSON.');
       return;
     }
@@ -120,15 +150,18 @@ function runKeepaHourlyScan() {
     const appendStats = appendDailyKeepaPull_(ss, products, { appendLimit: pageSize });
 
     SpreadsheetApp.flush();
+    log_(logSheet, `Keepa pages scanned: ${pagesScanned}`);
     log_(logSheet, `Keepa candidates fetched: ${candidatesFetched}`);
     log_(logSheet, `Keepa candidates evaluated: ${appendStats.evaluated}`);
     log_(logSheet, `Candidates deduped: ${appendStats.duplicateSkips}`);
     log_(logSheet, `Candidates passing pre-ingestion score: ${appendStats.opportunityPasses}`);
     log_(logSheet, `Candidates skipped as weak: ${appendStats.weakSkips}`);
+    log_(logSheet, `Viable/diverse products selected: ${appendStats.appended}`);
     log_(logSheet, `Products appended: ${appendStats.appended}`);
     log_(logSheet, `Products skipped due to brand cap: ${appendStats.brandCapSkips}`);
     log_(logSheet, `Top capped brands: ${appendStats.topCappedBrands || 'None'}`);
     log_(logSheet, `Token-limit stop/warning: ${tokenGuard.stopReason || 'None'}${tokenGuard.tokensLeft !== null ? ` (tokens left: ${tokenGuard.tokensLeft})` : ''}`);
+    log_(logSheet, `Keepa scan stop reason: ${scanStopReason}`);
     log_(logSheet, `Deeper page scanning used: ${pagesScanned > 1 ? 'Yes' : 'No'} (${pagesScanned} page${pagesScanned === 1 ? '' : 's'})`);
     log_(logSheet, `Completed hourly Keepa scan - next page will be ${nextPage}`);
 
