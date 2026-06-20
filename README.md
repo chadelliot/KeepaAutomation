@@ -6,7 +6,9 @@ Automate product discovery and sourcing for Hidden Gems LLC.
 
 The sourcing pipeline is designed to run without using `Source Link Finder` as a capped manual review queue:
 
-`Daily Keepa Pull` → `Qualified 2,000` → `Source Search Queue` → `Source Link Finder` processing → winners to `Source Matches` → losers/errors to `Source Link Finder Archive`
+`Daily Keepa Pull` → `Qualified` → `Source Search Queue` → `Source Link Finder` processing → winners to `Source Matches` → losers/errors to `Source Link Finder Archive`
+
+`Qualified` means all viable products that meet the automation criteria. It is not capped at 2,000 products. If an older workbook still has a `Qualified 2,000` tab, the script safely renames it to `Qualified` when it can do so without data loss; if both tabs exist, it leaves both in place and logs that no data was changed.
 
 Use `runAutomatedSourcingPipeline()` for the end-to-end sourcing pass. It runs these steps in order:
 
@@ -43,14 +45,27 @@ Rows marked `Yes` are moved to `Source Matches`; rows marked `No`, `Reject`, `Sk
 | `Velocity Signal` | Sales velocity context from monthly sales and sales-rank drops when available. |
 | `Match Signal` | UPC, brand, title-overlap, retailer-legitimacy, and product-risk summary. |
 
+Source scoring happens later, after a source URL and source price are found. It still evaluates retailer legitimacy, match confidence, UPC/brand/title alignment, product risk, and profitability against Max Buy Cost. Keepa pre-ingestion scoring does not depend on source URL or source price because those values are not known yet.
 
 ## Daily Keepa Pull brand diversity
 
-`runKeepaHourlyScan()` now applies brand diversity during the Daily Keepa Pull ingestion stage. Keepa candidates are deduped by ASIN/UPC across the workbook before brand selection, screened for profitability, velocity, product-quality, and risk signals, then grouped by normalized brand so one brand cannot consume the whole hourly batch.
+`runKeepaHourlyScan()` applies pre-ingestion scoring and brand diversity before rows are written to `Daily Keepa Pull`. Keepa candidates are deduped by ASIN/UPC across the workbook, scored using only available Keepa/product data, screened for profitability, velocity, product-quality, and risk signals, then grouped by normalized brand so one brand cannot consume the whole hourly batch.
 
-Brand diversity is a discovery control only: it does **not** override profitability or velocity requirements. Weak products, products without a likely sell price / max-buy-cost potential, products below the estimated 15% margin or $2 profit thresholds when calculable, weak velocity candidates, gift cards, subscriptions, apps/downloads, renewed/refurbished electronics, and restricted/risky brands are skipped before any brand slot is consumed.
+Brand diversity is a discovery control only: it does **not** override profitability or velocity requirements. Weak products, duplicates, products without a likely sell price / max-buy-cost potential, products below the estimated 15% margin or $2 profit thresholds when calculable, weak velocity candidates, gift cards, subscriptions, apps/downloads, renewed/refurbished electronics, and restricted/risky brands are skipped before any brand slot is consumed.
 
-If the current Keepa query page is dominated by brands that have already hit the per-run cap, the scanner can continue into deeper Keepa query pages until it appends the hourly target, reaches the diversity scan limit, or stops because Keepa/API behavior would require additional unexpected calls. Run Log entries include candidates fetched/evaluated, opportunity-filter passes, products appended, brand-cap skips, top capped brands, duplicate skips, weak/opportunity-filter skips, and whether deeper page scanning was used.
+`KEEPA_MAX_NEW_PRODUCTS_PER_BRAND` means no more than 5 viable new products per normalized brand are appended per Keepa run by default. Duplicate or weak products do not count toward the 5. Once 5 viable products are selected for a brand, additional products from that brand are skipped and the scan continues looking for other brands while the scan and token guard allow it.
+
+If the current Keepa query page is dominated by brands that have already hit the per-run cap, the scanner can continue into deeper Keepa query pages until it appends the hourly target, reaches the diversity scan limit, or stops because Keepa/API behavior or token availability would require additional unexpected calls. Run Log entries include candidates fetched/evaluated, candidates deduped, candidates passing pre-ingestion score, candidates skipped as weak, products appended, brand-cap skips, top capped brands, token-limit stop/warning, and whether deeper page scanning was used.
+
+`Daily Keepa Pull` includes Keepa-specific scoring fields:
+
+| Column | Purpose |
+| --- | --- |
+| `Keepa Opportunity Score` | 0-100 pre-ingestion score from available Keepa/product signals. |
+| `Keepa Profit Signal` | Max-buy-cost and estimated-profit threshold context. |
+| `Keepa Margin Signal` | Estimated margin threshold context when calculable. |
+| `Keepa Velocity Signal` | Monthly sales and sales-rank-drop context when available. |
+| `Keepa Risk Signal` | Product/category, brand restriction, and title-quality risk context. |
 
 ## Tuning script properties
 
@@ -58,6 +73,7 @@ If the current Keepa query page is dominated by brands that have already hit the
 | --- | ---: | --- |
 | `KEEPA_MAX_NEW_PRODUCTS_PER_BRAND` | `5` | Maximum new Daily Keepa Pull products appended per normalized brand per Keepa scan run, after dedupe and opportunity filtering. |
 | `KEEPA_BRAND_DIVERSITY_SCAN_LIMIT` | `250` | Maximum Keepa candidates evaluated per run while searching deeper pages for qualified, diverse products. |
+| `KEEPA_MIN_TOKENS_TO_CONTINUE` | `50` | Minimum Keepa token balance required before deeper scanning continues. Low tokens or HTTP 429 stops the scan gracefully and logs a warning. |
 | `SOURCE_LINK_FINDER_BATCH_LIMIT` | `100` | Maximum eligible rows moved from `Source Search Queue` into `Source Link Finder` per refill run. This is a per-run batch limit, not a total Source Link Finder cap. |
 | `SOURCE_QUEUE_SCAN_LIMIT` | `1000` | Maximum Source Search Queue rows scanned per refill run so brand-heavy queues do not scan forever. |
 | `SOURCE_LINK_FINDER_MAX_PER_BRAND` | `5` | Maximum active rows per brand in `Source Link Finder`; approved/rejected rows are moved/archived before brand counts are calculated. |
