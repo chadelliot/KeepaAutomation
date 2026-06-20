@@ -135,12 +135,17 @@ function runKeepaHourlyScan() {
     if (scanStopReason === 'scan limit reached' && viableDiverseSelected < pageSize) {
       log_(logSheet, `WARNING Keepa brand diversity scan limit reached before filling target: ${viableDiverseSelected}/${pageSize} viable diverse products.`);
     }
+    if (scanStopReason === 'token budget reached' && viableDiverseSelected < pageSize) {
+      log_(logSheet, `WARNING Keepa deeper-page scan wanted more products but stopped due to token budget: selected ${viableDiverseSelected}/${pageSize}`);
+    }
 
     props.setProperty('KEEPA_QUERY_PAGE', String(nextPage));
 
     if (!products.length) {
       log_(logSheet, `Keepa pages scanned: ${pagesScanned}`);
       log_(logSheet, `Keepa candidates fetched: ${candidatesFetched}`);
+      log_(logSheet, `Viable/diverse products selected: ${viableDiverseSelected}`);
+      log_(logSheet, `Deeper page scanning used: ${pagesScanned > 1 ? 'Yes' : 'No'} (${pagesScanned} page${pagesScanned === 1 ? '' : 's'})`);
       log_(logSheet, `Token-limit stop/warning: ${tokenGuard.stopReason || 'None'}${tokenGuard.tokensLeft !== null ? ` (tokens left: ${tokenGuard.tokensLeft})` : ''}`);
       log_(logSheet, `Keepa scan stop reason: ${scanStopReason}`);
       log_(logSheet, tokenGuard.stopReason ? 'No products appended because Keepa token/API guard stopped before product details were available.' : 'No ASINs returned. Check Keepa Product Finder filters or KEEPA_SELECTION_JSON.');
@@ -261,6 +266,7 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
     const rowsToMove = [];
     const queueRowsToDelete = [];
+    const duplicateQueueRowsToDelete = [];
     const cappedBrandSkips = {};
     let duplicateSkips = 0;
 
@@ -273,6 +279,7 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
       if ((asin && existingProductKeys.asins.has(asin)) || (upc && existingProductKeys.upcs.has(upc))) {
         duplicateSkips++;
+        duplicateQueueRowsToDelete.push(i + 2);
         continue;
       }
 
@@ -290,7 +297,11 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
     if (rowsToMove.length) {
       writeRowsToFinderProductSlots_(finderSheet, rowsToMove, finderStats.emptyProductRows, finderColumnCount);
-      deleteRowsBottomUp_(queueSheet, queueRowsToDelete);
+    }
+
+    const deletedQueueRows = queueRowsToDelete.concat(duplicateQueueRowsToDelete);
+    if (deletedQueueRows.length) {
+      deleteRowsBottomUp_(queueSheet, deletedQueueRows);
     }
 
     const skippedDueToBrandCap = Object.keys(cappedBrandSkips).reduce((sum, brand) => sum + cappedBrandSkips[brand], 0);
@@ -299,10 +310,11 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
     SpreadsheetApp.flush();
     log_(logSheet, `Rows moved to Source Link Finder: ${rowsToMove.length}`);
+    log_(logSheet, `Rows skipped due to existing ASIN/UPC dedupe: ${duplicateSkips}`);
+    log_(logSheet, `Duplicate Source Search Queue rows removed: ${duplicateQueueRowsToDelete.length}`);
     log_(logSheet, `Rows skipped due to brand cap: ${skippedDueToBrandCap}`);
     log_(logSheet, `Top brands capped: ${topBrandsCapped || 'None'}`);
     log_(logSheet, `Queue scan limit reached: ${scanLimitReached ? 'Yes' : 'No'} (${scanRows}/${queueLastRow - 1} rows scanned)`);
-    if (duplicateSkips) log_(logSheet, `Rows skipped due to existing ASIN dedupe: ${duplicateSkips}`);
     log_(logSheet, 'Completed Source Search Queue transfer');
   } catch (err) {
     log_(logSheet, `ERROR Source Search Queue transfer: ${err.message}`);
