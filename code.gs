@@ -14,6 +14,7 @@ const SHEETS = {
   QUALIFIED_LEGACY: 'Qualified 2,000',
   SOURCE_LINK_FINDER: 'Source Link Finder',
   SOURCE_LINK_FINDER_ARCHIVE: 'Source Link Finder Archive',
+  REJECTED_ARCHIVE: 'Rejected Archive',
   SOURCE_SEARCH_QUEUE: 'Source Search Queue',
   SOURCE_MATCHES: 'Source Matches'
 };
@@ -111,6 +112,9 @@ function runKeepaHourlyScan() {
         break;
       }
 
+      pageProducts.forEach(product => {
+        product.keepaQueryPage = page;
+      });
       products.push.apply(products, pageProducts);
       log_(logSheet, `Fetched product details for ${pageProducts.length} ASINs from page ${page}`);
 
@@ -180,6 +184,10 @@ function runKeepaHourlyScan() {
     log_(logSheet, `Keepa candidates evaluated: ${appendStats.evaluated}`);
     log_(logSheet, `Keepa products scanned: ${appendStats.evaluated}`);
     log_(logSheet, `Candidates deduped: ${appendStats.duplicateSkips}`);
+    log_(logSheet, `Candidates skipped by rolling brand cap: ${appendStats.rollingBrandCapSkips || 0}`);
+    log_(logSheet, `Candidates skipped by rolling category/product-family cap: ${appendStats.rollingCategoryCapSkips || 0}`);
+    log_(logSheet, `Top skipped brands: ${appendStats.topRollingBrandSkips || 'None'}`);
+    log_(logSheet, `Top skipped categories/product families: ${appendStats.topRollingCategorySkips || 'None'}`);
     log_(logSheet, `Candidates rejected by profit: ${appendStats.profitRejects}`);
     log_(logSheet, `Candidates rejected by margin: ${appendStats.marginRejects}`);
     log_(logSheet, `Candidates rejected by velocity: ${appendStats.velocityRejects}`);
@@ -190,6 +198,8 @@ function runKeepaHourlyScan() {
     log_(logSheet, `Candidates skipped as weak: ${appendStats.weakSkips}`);
     log_(logSheet, `Viable/diverse products selected: ${appendStats.appended}`);
     log_(logSheet, `Qualified products inserted: ${appendStats.appended}`);
+    log_(logSheet, `Number added to Daily Keepa Pull: ${appendStats.appended}`);
+    log_(logSheet, `Number added to Qualified: ${(appendStats.qualifiedRows || []).length}`);
     log_(logSheet, `Products appended: ${appendStats.appended}`);
     log_(logSheet, `Products skipped due to brand cap: ${appendStats.brandCapSkips}`);
     log_(logSheet, `Top capped brands: ${appendStats.topCappedBrands || 'None'}`);
@@ -327,6 +337,30 @@ function sha256Hex_(value) {
   }).join('');
 }
 
+function hideInactiveWorkflowTabs_(ss, logSheet) {
+  const inactiveTabs = [
+    SHEETS.SOURCE_SEARCH_QUEUE,
+    'Watchlist',
+    'High-Value Winners',
+    'Source Directory',
+    'Brand List',
+    'Purchase Tracker'
+  ];
+  let hidden = 0;
+
+  inactiveTabs.forEach(name => {
+    const sheet = ss.getSheetByName(name);
+    if (!sheet || sheet.isSheetHidden()) return;
+
+    sheet.hideSheet();
+    hidden++;
+  });
+
+  if (logSheet) {
+    log_(logSheet, `Inactive workflow tabs hidden: ${hidden}`);
+  }
+}
+
 /**
 * Runs the automated sourcing workflow end-to-end.
 */
@@ -335,14 +369,130 @@ function runAutomatedSourcingPipeline() {
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
 
   log_(logSheet, 'Started automated sourcing pipeline');
+  hideInactiveWorkflowTabs_(ss, logSheet);
   getQualifiedSheet_(ss, logSheet);
-  moveApprovedSourceMatches();
-  cleanupSourceLinkFinderRejectedRows();
-  moveSourceSearchQueueToSourceLinkFinder();
+  const movedToMatchesBefore = moveApprovedSourceMatches();
+  const archivedBefore = cleanupSourceLinkFinderRejectedRows();
+  const movedToFinder = moveQualifiedRowsToSourceLinkFinder();
   runSerpApiSourceFinder();
-  moveApprovedSourceMatches();
-  cleanupSourceLinkFinderRejectedRows();
+  const movedToMatchesAfter = moveApprovedSourceMatches();
+  const archivedAfter = cleanupSourceLinkFinderRejectedRows();
+  log_(logSheet, `Pipeline summary - moved to Source Link Finder: ${movedToFinder}`);
+  log_(logSheet, `Pipeline summary - moved to Source Matches: ${movedToMatchesBefore + movedToMatchesAfter}`);
+  log_(logSheet, `Pipeline summary - moved to Rejected Archive: ${archivedBefore + archivedAfter}`);
   log_(logSheet, 'Completed automated sourcing pipeline');
+}
+
+/**
+* Moves pre-qualified products directly from Qualified into Source Link Finder.
+* Source Search Queue is no longer required for the normal user workflow.
+*/
+function moveQualifiedRowsToSourceLinkFinder() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
+  const qualifiedSheet = getQualifiedSheet_(ss, logSheet);
+  const finderSheet = ss.getSheetByName(SHEETS.SOURCE_LINK_FINDER);
+
+  if (!finderSheet) {
+    throw new Error('Source Link Finder tab not found.');
+  }
+
+  return movePreQualifiedRowsToSourceLinkFinder_(ss, logSheet, qualifiedSheet, finderSheet, 'Qualified');
+}
+
+function movePreQualifiedRowsToSourceLinkFinder_(ss, logSheet, sourceSheet, finderSheet, sourceLabel) {
+  const props = PropertiesService.getScriptProperties();
+  const maxPerBrand = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_MAX_PER_BRAND', 5);
+  const sourceScanLimit = getPositiveIntegerProperty_(props, 'SOURCE_QUEUE_SCAN_LIMIT', 1000);
+  const batchLimit = getPositiveIntegerProperty_(props, 'SOURCE_LINK_FINDER_BATCH_LIMIT', 100);
+
+  log_(logSheet, `Started ${sourceLabel} to Source Link Finder transfer. Max per brand: ${maxPerBrand}, batch limit: ${batchLimit}, scan limit: ${sourceScanLimit}`);
+
+  const finderStats = getFinderProductRowStats_(finderSheet);
+  log_(logSheet, `Active Source Link Finder rows after cleanup: ${finderStats.activeProductRows}`);
+
+  const sourceLastRow = sourceSheet.getLastRow();
+  if (sourceLastRow < 2) {
+    log_(logSheet, `Rows moved from ${sourceLabel} to Source Link Finder: 0`);
+    return 0;
+  }
+
+  const finderActiveBrandCounts = getActiveFinderBrandCounts_(finderSheet);
+  const existingProductKeys = getExistingProductKeysAcrossSheets_(ss, [
+    SHEETS.SOURCE_LINK_FINDER,
+    SHEETS.SOURCE_MATCHES,
+    SHEETS.SOURCE_LINK_FINDER_ARCHIVE,
+    SHEETS.REJECTED_ARCHIVE
+  ]);
+  const scanRows = Math.min(sourceScanLimit, sourceLastRow - 1);
+  const sourceColumnCount = sourceSheet.getLastColumn();
+  const finderColumnCount = finderSheet.getLastColumn();
+  const writeColumnCount = Math.min(sourceColumnCount, finderColumnCount);
+  const sourceValues = sourceSheet.getRange(2, 1, scanRows, sourceColumnCount).getValues();
+
+  const rowsToMove = [];
+  const sourceRowsToDelete = [];
+  const duplicateRowsToDelete = [];
+  const unqualifiedRowsToDelete = [];
+  const cappedBrandSkips = {};
+  let duplicateSkips = 0;
+  let unqualifiedSkips = 0;
+
+  for (let i = 0; i < sourceValues.length && rowsToMove.length < batchLimit; i++) {
+    const row = sourceValues[i];
+    const asin = String(row[1] || '').trim();
+    const upc = String(row[4] || '').trim();
+    const brandKey = normalizeBrandKey_(row[3]);
+    const currentBrandCount = finderActiveBrandCounts[brandKey] || 0;
+
+    if ((asin && existingProductKeys.asins.has(asin)) || (upc && existingProductKeys.upcs.has(upc))) {
+      duplicateSkips++;
+      duplicateRowsToDelete.push(i + 2);
+      continue;
+    }
+
+    if (!isPreQualifiedKeepaQueueRow_(row, sourceColumnCount)) {
+      unqualifiedSkips++;
+      unqualifiedRowsToDelete.push(i + 2);
+      continue;
+    }
+
+    if (currentBrandCount >= maxPerBrand) {
+      cappedBrandSkips[brandKey] = (cappedBrandSkips[brandKey] || 0) + 1;
+      continue;
+    }
+
+    rowsToMove.push(padRow_(row.slice(0, writeColumnCount), finderColumnCount));
+    sourceRowsToDelete.push(i + 2);
+    if (asin) existingProductKeys.asins.add(asin);
+    if (upc) existingProductKeys.upcs.add(upc);
+    finderActiveBrandCounts[brandKey] = currentBrandCount + 1;
+  }
+
+  if (rowsToMove.length) {
+    writeRowsToFinderProductSlots_(finderSheet, rowsToMove, finderStats.emptyProductRows, finderColumnCount);
+  }
+
+  const deletedSourceRows = sourceRowsToDelete.concat(duplicateRowsToDelete, unqualifiedRowsToDelete);
+  if (deletedSourceRows.length) {
+    deleteRowsBottomUp_(sourceSheet, deletedSourceRows);
+  }
+
+  const skippedDueToBrandCap = Object.keys(cappedBrandSkips).reduce((sum, brand) => sum + cappedBrandSkips[brand], 0);
+  const topBrandsCapped = formatTopCappedBrands_(cappedBrandSkips);
+  const scanLimitReached = scanRows < (sourceLastRow - 1);
+
+  SpreadsheetApp.flush();
+  log_(logSheet, `Rows moved from ${sourceLabel} to Source Link Finder: ${rowsToMove.length}`);
+  log_(logSheet, `Rows moved to Source Link Finder: ${rowsToMove.length}`);
+  log_(logSheet, `Rows skipped due to existing ASIN/UPC dedupe: ${duplicateSkips}`);
+  log_(logSheet, `Duplicate ${sourceLabel} rows removed: ${duplicateRowsToDelete.length}`);
+  log_(logSheet, `Rows skipped as not pre-qualified: ${unqualifiedSkips}`);
+  log_(logSheet, `Rows skipped due to brand cap: ${skippedDueToBrandCap}`);
+  log_(logSheet, `Top brands capped: ${topBrandsCapped || 'None'}`);
+  log_(logSheet, `${sourceLabel} scan limit reached: ${scanLimitReached ? 'Yes' : 'No'} (${scanRows}/${sourceLastRow - 1} rows scanned)`);
+
+  return rowsToMove.length;
 }
 
 /**
@@ -387,7 +537,8 @@ function moveSourceSearchQueueToSourceLinkFinder() {
     const existingProductKeys = getExistingProductKeysAcrossSheets_(ss, [
       SHEETS.SOURCE_LINK_FINDER,
       SHEETS.SOURCE_MATCHES,
-      SHEETS.SOURCE_LINK_FINDER_ARCHIVE
+      SHEETS.SOURCE_LINK_FINDER_ARCHIVE,
+      SHEETS.REJECTED_ARCHIVE
     ]);
     const scanRows = Math.min(queueScanLimit, queueLastRow - 1);
     const queueColumnCount = queueSheet.getLastColumn();
@@ -483,6 +634,7 @@ function cleanupSourceLinkFinderRejectedRows() {
 
   if (lastRow < 2 || sourceColumnCount < 1) {
     log_(logSheet, 'Rows archived from Source Link Finder: 0');
+    log_(logSheet, 'Rows moved to Rejected Archive: 0');
     return 0;
   }
 
@@ -508,6 +660,7 @@ function cleanupSourceLinkFinderRejectedRows() {
 
   if (!rowsToArchive.length) {
     log_(logSheet, 'Rows archived from Source Link Finder: 0');
+    log_(logSheet, 'Rows moved to Rejected Archive: 0');
     return 0;
   }
 
@@ -523,6 +676,7 @@ function cleanupSourceLinkFinderRejectedRows() {
   SpreadsheetApp.flush();
 
   log_(logSheet, `Rows archived from Source Link Finder: ${rowsToArchive.length}`);
+  log_(logSheet, `Rows moved to Rejected Archive: ${rowsToArchive.length}`);
   return rowsToArchive.length;
 }
 
@@ -579,10 +733,10 @@ function moveApprovedSourceMatches() {
 }
 
 /**
-* Optional alias for queue refill triggers.
+* Optional alias for Source Link Finder refill triggers.
 */
 function refillSourceLinkFinderFromQueue() {
-  moveSourceSearchQueueToSourceLinkFinder();
+  moveQualifiedRowsToSourceLinkFinder();
 }
 
 /**
@@ -602,6 +756,8 @@ function runSerpApiSourceFinder() {
   try {
     log_(logSheet, 'Started SerpApi Source Finder batch');
     ensureOpportunityScoringColumns_(sheet);
+    const movedFromQualified = moveQualifiedRowsToSourceLinkFinder();
+    log_(logSheet, `Rows moved from Qualified to Source Link Finder before SerpApi search: ${movedFromQualified}`);
 
     const serpApiKey = getScriptProperty_('SERPAPI_API_KEY');
     const dailyCap = Number(PropertiesService.getScriptProperties().getProperty('SERPAPI_DAILY_CAP') || 8);
@@ -630,7 +786,7 @@ function runSerpApiSourceFinder() {
     }
 
     log_(logSheet, `Processing ${rows.length} SerpApi candidate rows`);
-    log_(logSheet, 'SerpApi query strategy: product-name-first');
+    log_(logSheet, 'SerpApi query strategy: product-title-first, UPC-validation-only');
 
     let autoApproved = 0;
     let autoRejected = 0;
@@ -691,6 +847,7 @@ function refreshKeepaWorkbook() {
   setupDailyKeepaHeaders_(ss);
   setupQualifiedOpportunityHeaders_(ss);
   setupSerpApiColumns();
+  hideInactiveWorkflowTabs_(ss, getOrCreateSheet_(ss, SHEETS.RUN_LOG));
   SpreadsheetApp.flush();
 }
 
@@ -872,10 +1029,12 @@ function buildSerpApiQueryPlan_(bestSearchQuery, upc, title, brand) {
     addSerpApiQueryAttempt_(queries, seen, fallbackQuery, 'legacy_product_query', 'Existing product-name query', false);
   }
 
-  addSerpApiQueryAttempt_(queries, seen, upcQuery, 'upc_fallback', 'UPC/GTIN fallback', true);
+  if (!queries.length) {
+    addSerpApiQueryAttempt_(queries, seen, upcQuery, 'upc_fallback', 'UPC/GTIN fallback', true);
+  }
 
   return {
-    strategy: 'product-name-first',
+    strategy: 'product-title-first, UPC-validation-only',
     primaryQuery: queries.length ? queries[0].query : '',
     queries
   };
@@ -1268,7 +1427,7 @@ function pickBestShoppingResult_(shoppingResults, rowObj, queryAttempt, queryPla
         queryType: queryAttempt ? queryAttempt.type : '',
         queryLabel: queryAttempt ? queryAttempt.label : '',
         usedUpcFallback: Boolean(queryAttempt && queryAttempt.usesUpcFallback),
-        queryStrategy: queryPlan ? queryPlan.strategy : 'product-name-first',
+        queryStrategy: queryPlan ? queryPlan.strategy : 'product-title-first, UPC-validation-only',
         notes
       };
     })
@@ -1583,7 +1742,7 @@ function buildSerpApiResultNotes_(rowObj, best, profitCheck) {
     : `UPC used as validation only (${best.upcValidationStatus})`;
   const parts = [
     `Query used: ${best.queryUsed || rowObj.query}`,
-    `Search strategy: ${best.queryStrategy || 'product-name-first'}; ${best.queryLabel || 'Product title/name'}`,
+    `Search strategy: ${best.queryStrategy || 'product-title-first, UPC-validation-only'}; ${best.queryLabel || 'Product title/name'}`,
     upcUse,
     `Match reason: ${best.matchReason}`,
     `Profit check versus Max Buy Cost: ${profitText}`,
@@ -1604,11 +1763,11 @@ function buildNoSerpApiResultNotes_(rowObj, searchOutcome) {
     .map(attempt => `${attempt.label}: "${attempt.query}" (${attempt.bestConfidence}; ${attempt.resultCount} results)`)
     .join('; ');
   const upcUse = searchOutcome.usedUpcFallback
-    ? 'UPC fallback was attempted after product-name searches.'
+    ? 'UPC fallback was attempted only because no usable product-title query found a credible match.'
     : 'UPC was not used as the primary query.';
 
   return [
-    `Query strategy: product-name-first`,
+    `Query strategy: product-title-first, UPC-validation-only`,
     attempts ? `Queries used: ${attempts}` : `No SerpApi query could be built from product title/name.`,
     upcUse,
     `Match reason: no credible shopping result found`,
@@ -1955,7 +2114,8 @@ function setupDailyKeepaHeaders_(ss) {
     'Keepa Velocity Signal',
     'Keepa Risk Signal',
     'Status',
-    'Notes'
+    'Notes',
+    'Keepa Query Page'
   ];
 
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -2022,16 +2182,13 @@ function getQualifiedOpportunityHeaders_() {
   ];
 }
 
-function appendRowsToQualifiedAndQueue_(ss, rows) {
+function appendRowsToQualified_(ss, rows) {
   const qualifiedSheet = getQualifiedSheet_(ss, getOrCreateSheet_(ss, SHEETS.RUN_LOG));
-  const queueSheet = getOrCreateSheet_(ss, SHEETS.SOURCE_SEARCH_QUEUE);
 
-  [qualifiedSheet, queueSheet].forEach(sheet => {
-    ensureSheetColumns_(sheet, rows[0].length);
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
-    sheet.getRange(2, 36, Math.max(1, sheet.getLastRow() - 1), 1).setNumberFormat('$#,##0.00');
-    sheet.getRange(2, 37, Math.max(1, sheet.getLastRow() - 1), 1).setNumberFormat('0.0%');
-  });
+  ensureSheetColumns_(qualifiedSheet, rows[0].length);
+  qualifiedSheet.getRange(qualifiedSheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  qualifiedSheet.getRange(2, 36, Math.max(1, qualifiedSheet.getLastRow() - 1), 1).setNumberFormat('$#,##0.00');
+  qualifiedSheet.getRange(2, 37, Math.max(1, qualifiedSheet.getLastRow() - 1), 1).setNumberFormat('0.0%');
 }
 
 function appendDailyKeepaPull_(ss, products, options) {
@@ -2047,6 +2204,13 @@ function appendDailyKeepaPull_(ss, products, options) {
   if (!rows.length) {
     const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
     log_(logSheet, 'No new ASINs/UPCs to append after dedupe, brand diversity, and opportunity filtering');
+    log_(logSheet, `Candidates deduped: ${selection.duplicateSkips || 0}`);
+    log_(logSheet, `Candidates skipped by rolling brand cap: ${selection.rollingBrandCapSkips || 0}`);
+    log_(logSheet, `Candidates skipped by rolling category/product-family cap: ${selection.rollingCategoryCapSkips || 0}`);
+    log_(logSheet, `Top skipped brands: ${selection.topRollingBrandSkips || 'None'}`);
+    log_(logSheet, `Top skipped categories/product families: ${selection.topRollingCategorySkips || 'None'}`);
+    log_(logSheet, 'Number added to Daily Keepa Pull: 0');
+    log_(logSheet, 'Number added to Qualified: 0');
     return selection;
   }
 
@@ -2054,32 +2218,44 @@ function appendDailyKeepaPull_(ss, products, options) {
 
   sheet.getRange(2, 9, Math.max(1, sheet.getLastRow() - 1), 3).setNumberFormat('$#,##0.00');
   sheet.getRange(2, 17, Math.max(1, sheet.getLastRow() - 1), 2).setNumberFormat('0.0%');
-  sheet.autoResizeColumns(1, 27);
+  sheet.autoResizeColumns(1, rows[0].length);
 
   if (qualifiedRows.length) {
-    appendRowsToQualifiedAndQueue_(ss, qualifiedRows);
+    appendRowsToQualified_(ss, qualifiedRows);
   }
 
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
   log_(logSheet, `Appended ${rows.length} new products to Daily Keepa Pull`);
   log_(logSheet, `Inserted ${qualifiedRows.length} pre-qualified products into Qualified`);
-  log_(logSheet, `Inserted ${qualifiedRows.length} pre-qualified products into Source Search Queue`);
+  log_(logSheet, `Number added to Daily Keepa Pull: ${rows.length}`);
+  log_(logSheet, `Number added to Qualified: ${qualifiedRows.length}`);
+  log_(logSheet, `Candidates skipped by rolling brand cap: ${selection.rollingBrandCapSkips || 0}`);
+  log_(logSheet, `Candidates skipped by rolling category/product-family cap: ${selection.rollingCategoryCapSkips || 0}`);
+  log_(logSheet, `Top skipped brands: ${selection.topRollingBrandSkips || 'None'}`);
+  log_(logSheet, `Top skipped categories/product families: ${selection.topRollingCategorySkips || 'None'}`);
+  log_(logSheet, 'Inserted 0 raw products into Source Search Queue; queue is internal/legacy only');
   return selection;
 }
 
 function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
   const maxPerBrand = getPositiveIntegerProperty_(props, 'KEEPA_MAX_NEW_PRODUCTS_PER_BRAND', 5);
+  const rollingBrandCap = getPositiveIntegerProperty_(props, 'KEEPA_ROLLING_BRAND_CAP', 5);
+  const rollingCategoryCap = getPositiveIntegerProperty_(props, 'KEEPA_ROLLING_CATEGORY_CAP', 10);
   const existingProductKeys = getExistingProductKeysAcrossSheets_(ss, [
     SHEETS.DAILY_KEEPA_PULL,
     SHEETS.QUALIFIED,
     SHEETS.SOURCE_LINK_FINDER,
     SHEETS.SOURCE_LINK_FINDER_ARCHIVE,
+    SHEETS.REJECTED_ARCHIVE,
     SHEETS.SOURCE_SEARCH_QUEUE,
     SHEETS.SOURCE_MATCHES
   ]);
+  const activeHistory = getActivePipelineHistoryStats_(ss);
   const seenAsins = new Set();
   const seenUpcs = new Set();
   const byBrand = {};
+  const rollingBrandSkips = {};
+  const rollingCategorySkips = {};
   const stats = {
     rows: [],
     qualifiedRows: [],
@@ -2094,7 +2270,11 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
     sourceabilityRejects: 0,
     scoreRejects: 0,
     brandCapSkips: 0,
+    rollingBrandCapSkips: 0,
+    rollingCategoryCapSkips: 0,
     topCappedBrands: '',
+    topRollingBrandSkips: '',
+    topRollingCategorySkips: '',
     selectedByBrandSummary: '',
     appended: 0
   };
@@ -2124,10 +2304,24 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
       return;
     }
 
-    stats.opportunityPasses++;
     const brandKey = normalizeBrandKey_(product.brand);
+    const categoryKey = getProductFamilyKey_(product);
+    const activeBrandCount = activeHistory.brandCounts[brandKey] || 0;
+    const activeCategoryCount = activeHistory.categoryCounts[categoryKey] || 0;
+
+    if (activeBrandCount >= rollingBrandCap) {
+      rollingBrandSkips[brandKey] = (rollingBrandSkips[brandKey] || 0) + 1;
+      return;
+    }
+
+    if (activeCategoryCount >= rollingCategoryCap) {
+      rollingCategorySkips[categoryKey] = (rollingCategorySkips[categoryKey] || 0) + 1;
+      return;
+    }
+
+    stats.opportunityPasses++;
     if (!byBrand[brandKey]) byBrand[brandKey] = [];
-    byBrand[brandKey].push({ product, opportunity });
+    byBrand[brandKey].push({ product, opportunity, categoryKey });
   });
 
   const cappedBrandSkips = {};
@@ -2139,14 +2333,40 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
     if (candidates.length > maxPerBrand) cappedBrandSkips[brandKey] = candidates.length - maxPerBrand;
   });
 
-  const finalSelection = selected
-    .sort((a, b) => b.opportunity.score - a.opportunity.score)
-    .slice(0, appendLimit);
-
+  const finalSelection = [];
   const selectedByBrand = {};
+  const selectedByCategory = {};
+
+  selected
+    .sort((a, b) => b.opportunity.score - a.opportunity.score)
+    .forEach(item => {
+      if (finalSelection.length >= appendLimit) return;
+
+      const brandKey = normalizeBrandKey_(item.product.brand);
+      const categoryKey = item.categoryKey || getProductFamilyKey_(item.product);
+      const selectedBrandCount = selectedByBrand[brandKey] || 0;
+      const selectedCategoryCount = selectedByCategory[categoryKey] || 0;
+
+      if ((activeHistory.brandCounts[brandKey] || 0) + selectedBrandCount >= rollingBrandCap) {
+        rollingBrandSkips[brandKey] = (rollingBrandSkips[brandKey] || 0) + 1;
+        return;
+      }
+
+      if ((activeHistory.categoryCounts[categoryKey] || 0) + selectedCategoryCount >= rollingCategoryCap) {
+        rollingCategorySkips[categoryKey] = (rollingCategorySkips[categoryKey] || 0) + 1;
+        return;
+      }
+
+      finalSelection.push(item);
+      selectedByBrand[brandKey] = selectedBrandCount + 1;
+      selectedByCategory[categoryKey] = selectedCategoryCount + 1;
+    });
+
   finalSelection.forEach(item => {
     const brandKey = normalizeBrandKey_(item.product.brand);
-    selectedByBrand[brandKey] = (selectedByBrand[brandKey] || 0) + 1;
+    const categoryKey = item.categoryKey || getProductFamilyKey_(item.product);
+    activeHistory.brandCounts[brandKey] = (activeHistory.brandCounts[brandKey] || 0) + 1;
+    activeHistory.categoryCounts[categoryKey] = (activeHistory.categoryCounts[categoryKey] || 0) + 1;
     item.opportunity.brandDiversitySignal = `Brand diversity slot ${selectedByBrand[brandKey]}/${maxPerBrand}`;
     stats.rows.push(buildKeepaRow_(item.product, item.opportunity));
     stats.qualifiedRows.push(buildQualifiedOpportunityRow_(item.product, item.opportunity));
@@ -2158,7 +2378,11 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
 
   stats.appended = stats.rows.length;
   stats.brandCapSkips = Object.keys(cappedBrandSkips).reduce((sum, brand) => sum + cappedBrandSkips[brand], 0);
+  stats.rollingBrandCapSkips = Object.keys(rollingBrandSkips).reduce((sum, brand) => sum + rollingBrandSkips[brand], 0);
+  stats.rollingCategoryCapSkips = Object.keys(rollingCategorySkips).reduce((sum, category) => sum + rollingCategorySkips[category], 0);
   stats.topCappedBrands = formatTopCappedBrands_(cappedBrandSkips);
+  stats.topRollingBrandSkips = formatBrandCounts_(rollingBrandSkips);
+  stats.topRollingCategorySkips = formatBrandCounts_(rollingCategorySkips);
   stats.selectedByBrandSummary = formatBrandCounts_(selectedByBrand);
   return stats;
 }
@@ -2391,10 +2615,12 @@ function isRestrictedKeepaBrand_(brand, product) {
 function getExistingAsins_(sheet) {
   const lastRow = sheet.getLastRow();
   const set = new Set();
+  const asinColumn = getAsinColumnForSheet_(sheet);
 
   if (lastRow < 2) return set;
+  if (sheet.getLastColumn() < asinColumn) return set;
 
-  const values = sheet.getRange(2, 2, lastRow - 1, 1).getValues();
+  const values = sheet.getRange(2, asinColumn, lastRow - 1, 1).getValues();
 
   values.forEach(row => {
     if (row[0]) set.add(String(row[0]).trim());
@@ -2427,16 +2653,119 @@ function getExistingProductKeysAcrossSheets_(ss, sheetNames) {
 function getExistingUpcs_(sheet) {
   const lastRow = sheet.getLastRow();
   const set = new Set();
+  const upcColumn = getUpcColumnForSheet_(sheet);
 
-  if (lastRow < 2 || sheet.getLastColumn() < 5) return set;
+  if (lastRow < 2 || sheet.getLastColumn() < upcColumn) return set;
 
-  const values = sheet.getRange(2, 5, lastRow - 1, 1).getValues();
+  const values = sheet.getRange(2, upcColumn, lastRow - 1, 1).getValues();
 
   values.forEach(row => {
     if (row[0]) set.add(String(row[0]).trim());
   });
 
   return set;
+}
+
+function getUpcColumnForSheet_(sheet) {
+  if (sheet && sheet.getName && sheet.getName() === SHEETS.DAILY_KEEPA_PULL) return 8;
+  return getHeaderColumnIndex_(sheet, [/^upc\b/i, /gtin/i, /ean/i], 5);
+}
+
+function getAsinColumnForSheet_(sheet) {
+  return getHeaderColumnIndex_(sheet, [/^asin$/i], 2);
+}
+
+function getHeaderColumnIndex_(sheet, patterns, fallbackColumn) {
+  if (!sheet || sheet.getLastRow() < 1 || sheet.getLastColumn() < 1) return fallbackColumn;
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  for (let i = 0; i < headers.length; i++) {
+    const header = String(headers[i] || '').trim();
+    if (patterns.some(pattern => pattern.test(header))) return i + 1;
+  }
+
+  return fallbackColumn;
+}
+
+function getActivePipelineHistoryStats_(ss) {
+  const stats = {
+    brandCounts: {},
+    categoryCounts: {}
+  };
+
+  [
+    SHEETS.DAILY_KEEPA_PULL,
+    SHEETS.QUALIFIED,
+    SHEETS.SOURCE_LINK_FINDER,
+    SHEETS.SOURCE_MATCHES
+  ].forEach(sheetName => {
+    const sheet = sheetName === SHEETS.QUALIFIED ? getQualifiedSheet_(ss, null) : ss.getSheetByName(sheetName);
+    if (!sheet) return;
+
+    getActivePipelineProductRows_(sheet).forEach(item => {
+      const brandKey = normalizeBrandKey_(item.brand);
+      const categoryKey = getProductFamilyKeyFromParts_(item.brand, item.title, item.category);
+
+      stats.brandCounts[brandKey] = (stats.brandCounts[brandKey] || 0) + 1;
+      stats.categoryCounts[categoryKey] = (stats.categoryCounts[categoryKey] || 0) + 1;
+    });
+  });
+
+  return stats;
+}
+
+function getActivePipelineProductRows_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const values = [];
+  if (lastRow < 2) return values;
+
+  const columnCount = sheet.getLastColumn();
+  const rows = sheet.getRange(2, 1, lastRow - 1, columnCount).getValues();
+  const isDaily = sheet.getName && sheet.getName() === SHEETS.DAILY_KEEPA_PULL;
+
+  rows.forEach(row => {
+    if (!rowHasProductIdentity_(row)) return;
+    if (!isDaily && (hasApprovedMoveDecision_(row) || hasRejectedMoveDecision_(row) || hasClearFinalRejectedDecision_(row))) return;
+
+    values.push({
+      title: row[2],
+      brand: row[3],
+      category: isDaily ? row[4] : row[9]
+    });
+  });
+
+  return values;
+}
+
+function getProductFamilyKey_(product) {
+  return getProductFamilyKeyFromParts_(
+    product && product.brand,
+    product && product.title,
+    getCategoryName_(product)
+  );
+}
+
+function getProductFamilyKeyFromParts_(brand, title, category) {
+  const brandKey = normalizeBrandKey_(brand);
+  const categoryKey = normalize_(category) || 'uncategorized';
+  const titleTokens = getProductFamilyTitleTokens_(title, brand);
+  const family = titleTokens.length ? titleTokens.join(' ') : categoryKey;
+
+  return `${brandKey} / ${categoryKey} / ${family}`;
+}
+
+function getProductFamilyTitleTokens_(title, brand) {
+  const brandWords = {};
+  normalize_(brand).split(' ').forEach(word => {
+    if (word) brandWords[word] = true;
+  });
+
+  const tokens = normalize_(title)
+    .split(' ')
+    .filter(token => token.length >= 4 && !brandWords[token] && !isGenericTitleToken_(token) && !/^\d+$/.test(token))
+    .slice(0, 4);
+
+  return tokens;
 }
 
 function buildKeepaRow_(product, opportunity) {
@@ -2512,7 +2841,8 @@ function buildKeepaRow_(product, opportunity) {
     keepaOpportunity.velocitySignal,
     keepaOpportunity.riskSignal,
     status,
-    notes.join('; ')
+    notes.join('; '),
+    product.keepaQueryPage !== undefined && product.keepaQueryPage !== null ? product.keepaQueryPage : ''
   ];
 }
 
