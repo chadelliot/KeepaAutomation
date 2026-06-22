@@ -18,6 +18,8 @@ const SHEETS = {
   SOURCE_MATCHES: 'Source Matches'
 };
 
+const KEEPA_SELECTION_HASH_PROPERTY = 'KEEPA_SELECTION_JSON_HASH';
+
 /************************************************************
 * MAIN FUNCTIONS
 ************************************************************/
@@ -25,7 +27,7 @@ const SHEETS = {
 /**
 * HOURLY KEEPA SCAN
 * Appends new Keepa products without clearing the sheet.
-* FIXED: rotates through Keepa query pages so it does not keep pulling same top 50.
+* Uses a forward-only Keepa query page cursor so it does not keep pulling the same top 50.
 */
 function runKeepaHourlyScan() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
@@ -33,12 +35,11 @@ function runKeepaHourlyScan() {
 
   const props = PropertiesService.getScriptProperties();
   const pageSize = getPositiveIntegerProperty_(props, 'KEEPA_HOURLY_PAGE_SIZE', 50);
-  const maxPages = getPositiveIntegerProperty_(props, 'KEEPA_MAX_ROTATION_PAGES', 40);
   const maxCandidatesToEvaluate = getPositiveIntegerProperty_(props, 'KEEPA_BRAND_DIVERSITY_SCAN_LIMIT', 250);
   const minTokensToContinue = getPositiveIntegerProperty_(props, 'KEEPA_MIN_TOKENS_TO_CONTINUE', 50);
-  const currentPage = Number(props.getProperty('KEEPA_QUERY_PAGE') || 0);
+  const rotationState = prepareKeepaRotationState_(props, logSheet);
+  const currentPage = rotationState.currentPage;
   const requestedPagesToScan = Math.max(1, Math.ceil(maxCandidatesToEvaluate / pageSize));
-  const maxPagesToScan = Math.min(requestedPagesToScan, maxPages);
   const tokenGuard = {
     minTokensToContinue,
     tokensLeft: null,
@@ -49,26 +50,25 @@ function runKeepaHourlyScan() {
   let candidatesFetched = 0;
   let viableDiverseSelected = 0;
   let scanStopReason = '';
+  let noAsinsReturned = false;
   let nextPage = currentPage;
   const products = [];
   const scannedKeepaPages = [];
 
   try {
     log_(logSheet, `Started hourly Keepa scan - page ${currentPage}`);
+    log_(logSheet, `Starting Keepa page: ${currentPage}`);
+    log_(logSheet, `Keepa selection JSON reset this run: ${rotationState.resetDueToSelectionChange ? 'Yes' : 'No'}`);
 
     const apiKey = getScriptProperty_('KEEPA_API_KEY');
 
-    if (requestedPagesToScan > maxPages) {
-      log_(logSheet, `WARNING Keepa brand diversity scan would wrap past configured rotation pages (${requestedPagesToScan}/${maxPages}); stopping before repeated page/API calls.`);
-    }
-
     while (
       viableDiverseSelected < pageSize &&
-      pagesScanned < maxPagesToScan &&
+      pagesScanned < requestedPagesToScan &&
       candidatesFetched < maxCandidatesToEvaluate &&
       !tokenGuard.stopReason
     ) {
-      const page = (currentPage + pagesScanned) % maxPages;
+      const page = currentPage + pagesScanned;
       let asins = [];
       try {
         asins = fetchKeepaAsins_(apiKey, pageSize, page, tokenGuard);
@@ -80,9 +80,13 @@ function runKeepaHourlyScan() {
       }
 
       scannedKeepaPages.push(page);
+      nextPage = getNextKeepaPage_(page);
       log_(logSheet, `Fetched ${asins.length} ASINs from Keepa query page ${page}`);
 
-      if (!asins.length) break;
+      if (!asins.length) {
+        noAsinsReturned = true;
+        break;
+      }
       if (tokenGuard.stopReason) {
         log_(logSheet, `WARNING ${tokenGuard.stopReason}`);
         break;
@@ -111,7 +115,6 @@ function runKeepaHourlyScan() {
       log_(logSheet, `Fetched product details for ${pageProducts.length} ASINs from page ${page}`);
 
       pagesScanned++;
-      nextPage = (page + 1) % maxPages;
 
       const preview = selectKeepaProductsForAppend_(ss, products, pageSize, props);
       viableDiverseSelected = preview.rows.length;
@@ -130,7 +133,7 @@ function runKeepaHourlyScan() {
     if (!scanStopReason) {
       if (tokenGuard.stopReason) scanStopReason = 'token budget reached';
       else if (viableDiverseSelected >= pageSize) scanStopReason = 'target filled';
-      else if (candidatesFetched >= maxCandidatesToEvaluate || pagesScanned >= maxPagesToScan) scanStopReason = 'scan limit reached';
+      else if (candidatesFetched >= maxCandidatesToEvaluate || pagesScanned >= requestedPagesToScan) scanStopReason = 'scan limit reached';
       else scanStopReason = 'no more Keepa candidates';
     }
 
@@ -141,17 +144,24 @@ function runKeepaHourlyScan() {
       log_(logSheet, `WARNING Keepa deeper-page scan wanted more products but stopped due to token budget: selected ${viableDiverseSelected}/${pageSize}`);
     }
 
+    const pagesActuallyScanned = scannedKeepaPages.length;
     props.setProperty('KEEPA_QUERY_PAGE', String(nextPage));
 
     if (!products.length) {
-      log_(logSheet, `Keepa pages scanned: ${pagesScanned}`);
+      log_(logSheet, `Keepa pages scanned: ${pagesActuallyScanned}`);
+      log_(logSheet, `Number of Keepa pages scanned: ${pagesActuallyScanned}`);
       log_(logSheet, `Keepa page numbers scanned: ${scannedKeepaPages.length ? scannedKeepaPages.join(', ') : 'None'}`);
+      log_(logSheet, `Next Keepa page saved: ${nextPage}`);
+      log_(logSheet, `Keepa selection JSON reset this run: ${rotationState.resetDueToSelectionChange ? 'Yes' : 'No'}`);
+      log_(logSheet, `Token budget stopped run: ${tokenGuard.stopReason ? 'Yes' : 'No'}`);
+      log_(logSheet, `No ASINs returned: ${noAsinsReturned ? 'Yes' : 'No'}`);
       log_(logSheet, `Keepa candidates fetched: ${candidatesFetched}`);
       log_(logSheet, 'Keepa products scanned: 0');
       log_(logSheet, `Viable/diverse products selected: ${viableDiverseSelected}`);
-      log_(logSheet, `Deeper page scanning used: ${pagesScanned > 1 ? 'Yes' : 'No'} (${pagesScanned} page${pagesScanned === 1 ? '' : 's'})`);
+      log_(logSheet, `Deeper page scanning used: ${pagesActuallyScanned > 1 ? 'Yes' : 'No'} (${pagesActuallyScanned} page${pagesActuallyScanned === 1 ? '' : 's'})`);
       log_(logSheet, `Token-limit stop/warning: ${tokenGuard.stopReason || 'None'}${tokenGuard.tokensLeft !== null ? ` (tokens left: ${tokenGuard.tokensLeft})` : ''}`);
       log_(logSheet, `Keepa scan stop reason: ${scanStopReason}`);
+      log_(logSheet, `Completed hourly Keepa scan - next page will be ${nextPage}`);
       log_(logSheet, tokenGuard.stopReason ? 'No products appended because Keepa token/API guard stopped before product details were available.' : 'No ASINs returned. Check Keepa Product Finder filters or KEEPA_SELECTION_JSON.');
       return;
     }
@@ -159,8 +169,13 @@ function runKeepaHourlyScan() {
     const appendStats = appendDailyKeepaPull_(ss, products, { appendLimit: pageSize });
 
     SpreadsheetApp.flush();
-    log_(logSheet, `Keepa pages scanned: ${pagesScanned}`);
+    log_(logSheet, `Keepa pages scanned: ${pagesActuallyScanned}`);
+    log_(logSheet, `Number of Keepa pages scanned: ${pagesActuallyScanned}`);
     log_(logSheet, `Keepa page numbers scanned: ${scannedKeepaPages.length ? scannedKeepaPages.join(', ') : 'None'}`);
+    log_(logSheet, `Next Keepa page saved: ${nextPage}`);
+    log_(logSheet, `Keepa selection JSON reset this run: ${rotationState.resetDueToSelectionChange ? 'Yes' : 'No'}`);
+    log_(logSheet, `Token budget stopped run: ${tokenGuard.stopReason ? 'Yes' : 'No'}`);
+    log_(logSheet, `No ASINs returned: ${noAsinsReturned ? 'Yes' : 'No'}`);
     log_(logSheet, `Keepa candidates fetched: ${candidatesFetched}`);
     log_(logSheet, `Keepa candidates evaluated: ${appendStats.evaluated}`);
     log_(logSheet, `Keepa products scanned: ${appendStats.evaluated}`);
@@ -181,7 +196,7 @@ function runKeepaHourlyScan() {
     log_(logSheet, `Final selected count by brand: ${appendStats.selectedByBrandSummary || 'None'}`);
     log_(logSheet, `Token-limit stop/warning: ${tokenGuard.stopReason || 'None'}${tokenGuard.tokensLeft !== null ? ` (tokens left: ${tokenGuard.tokensLeft})` : ''}`);
     log_(logSheet, `Keepa scan stop reason: ${scanStopReason}`);
-    log_(logSheet, `Deeper page scanning used: ${pagesScanned > 1 ? 'Yes' : 'No'} (${pagesScanned} page${pagesScanned === 1 ? '' : 's'})`);
+    log_(logSheet, `Deeper page scanning used: ${pagesActuallyScanned > 1 ? 'Yes' : 'No'} (${pagesActuallyScanned} page${pagesActuallyScanned === 1 ? '' : 's'})`);
     log_(logSheet, `Completed hourly Keepa scan - next page will be ${nextPage}`);
 
   } catch (err) {
@@ -199,15 +214,117 @@ function runHourlyKeepaScanRotating() {
 }
 
 /**
+* Forces the next hourly Keepa scan to start at page 40.
+*/
+function setNextKeepaPageTo40() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('KEEPA_QUERY_PAGE', '40');
+
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
+  log_(logSheet, 'Set next Keepa hourly scan to start at page 40');
+}
+
+/**
 * Resets Keepa rotation back to page 0.
 * Run this manually after changing filters.
 */
 function resetKeepaRotation() {
-  PropertiesService.getScriptProperties().setProperty('KEEPA_QUERY_PAGE', '0');
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('KEEPA_QUERY_PAGE', '0');
+  props.setProperty(KEEPA_SELECTION_HASH_PROPERTY, getCurrentKeepaSelectionHash_(props));
 
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
   log_(logSheet, 'Reset Keepa query page rotation to 0');
+}
+
+function prepareKeepaRotationState_(props, logSheet) {
+  const currentHash = getCurrentKeepaSelectionHash_(props);
+  const previousHash = props.getProperty(KEEPA_SELECTION_HASH_PROPERTY);
+  let resetDueToSelectionChange = false;
+
+  if (!previousHash) {
+    props.setProperty(KEEPA_SELECTION_HASH_PROPERTY, currentHash);
+  } else if (previousHash !== currentHash) {
+    props.setProperty('KEEPA_QUERY_PAGE', '0');
+    props.setProperty(KEEPA_SELECTION_HASH_PROPERTY, currentHash);
+    resetDueToSelectionChange = true;
+    log_(logSheet, 'Keepa selection JSON changed; reset query page rotation to 0');
+  }
+
+  return {
+    currentPage: getKeepaRotationStartPage_(props),
+    resetDueToSelectionChange
+  };
+}
+
+function getKeepaRotationStartPage_(props) {
+  const rawPage = Number(props.getProperty('KEEPA_QUERY_PAGE') || 0);
+
+  if (!isFinite(rawPage) || rawPage < 0) return 0;
+
+  return Math.floor(rawPage);
+}
+
+function getNextKeepaPage_(page) {
+  return Math.floor(Number(page || 0)) + 1;
+}
+
+function getCurrentKeepaSelectionHash_(props) {
+  return sha256Hex_(getKeepaSelectionFingerprintSource_(props));
+}
+
+function getKeepaSelectionFingerprintSource_(props) {
+  const raw = props.getProperty('KEEPA_SELECTION_JSON');
+
+  if (raw) {
+    try {
+      return stableStringify_(JSON.parse(raw));
+    } catch (err) {
+      return String(raw);
+    }
+  }
+
+  return stableStringify_(getDefaultKeepaSelection_());
+}
+
+function getDefaultKeepaSelection_() {
+  return {
+    f: {
+      productType: {
+        values: ['0'],
+        filterType: 'set'
+      }
+    },
+    s: [
+      { colId: 'SALES_current', sort: 'asc' }
+    ],
+    t: 'g'
+  };
+}
+
+function stableStringify_(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+
+  if (Array.isArray(value)) {
+    return `[${value.map(item => stableStringify_(item)).join(',')}]`;
+  }
+
+  return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify_(value[key])}`).join(',')}}`;
+}
+
+function sha256Hex_(value) {
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(value || ''),
+    Utilities.Charset.UTF_8
+  );
+
+  return digest.map(byte => {
+    const value = byte < 0 ? byte + 256 : byte;
+    return (`0${value.toString(16)}`).slice(-2);
+  }).join('');
 }
 
 /**
@@ -513,10 +630,14 @@ function runSerpApiSourceFinder() {
     }
 
     log_(logSheet, `Processing ${rows.length} SerpApi candidate rows`);
+    log_(logSheet, 'SerpApi query strategy: product-name-first');
 
     let autoApproved = 0;
     let autoRejected = 0;
     let leftReview = 0;
+    let rowsSearchedByProductTitle = 0;
+    let rowsRequiringUpcFallback = 0;
+    let rowsRejectedDueToUpcTitleMismatch = 0;
 
     rows.forEach(rowObj => {
       try {
@@ -524,6 +645,9 @@ function runSerpApiSourceFinder() {
         if (result.decision === 'Yes') autoApproved++;
         if (result.decision === 'No') autoRejected++;
         if (result.decision === 'Review') leftReview++;
+        if (result.usedProductTitleSearch) rowsSearchedByProductTitle++;
+        if (result.usedUpcFallback) rowsRequiringUpcFallback++;
+        if (result.rejectedDueToUpcTitleMismatch) rowsRejectedDueToUpcTitleMismatch++;
         log_(logSheet, `SERPAPI_SEARCH row ${rowObj.rowNumber}: ${rowObj.asin} - completed with ${result.decision}`);
         Utilities.sleep(1200);
       } catch (err) {
@@ -538,6 +662,9 @@ function runSerpApiSourceFinder() {
     log_(logSheet, `Rows auto-approved Yes: ${autoApproved}`);
     log_(logSheet, `Rows auto-rejected No: ${autoRejected}`);
     log_(logSheet, `Rows left Review: ${leftReview}`);
+    log_(logSheet, `Rows searched by product title: ${rowsSearchedByProductTitle}`);
+    log_(logSheet, `Rows requiring UPC fallback: ${rowsRequiringUpcFallback}`);
+    log_(logSheet, `Rows rejected due to UPC/title mismatch: ${rowsRejectedDueToUpcTitleMismatch}`);
     moveApprovedSourceMatches();
     cleanupSourceLinkFinderRejectedRows();
     log_(logSheet, 'Completed SerpApi Source Finder batch');
@@ -702,6 +829,9 @@ function getSerpApiCandidateRows_(sheet, cap) {
     if (lastChecked) return;
     if (!maxBuyCost) return;
 
+    const queryPlan = buildSerpApiQueryPlan_(bestSearchQuery, upc, title, brand);
+    if (!queryPlan.queries.length) return;
+
     candidates.push({
       rowNumber,
       asin,
@@ -712,7 +842,8 @@ function getSerpApiCandidateRows_(sheet, cap) {
       maxBuyCost,
       monthlySales,
       salesRankDrops,
-      query: buildSerpApiQuery_(bestSearchQuery, upc, title, brand),
+      query: queryPlan.primaryQuery,
+      queryPlan,
       priorityScore
     });
   });
@@ -723,29 +854,196 @@ function getSerpApiCandidateRows_(sheet, cap) {
 }
 
 function buildSerpApiQuery_(bestSearchQuery, upc, title, brand) {
-  if (upc) return String(upc).trim();
-  if (bestSearchQuery) return String(bestSearchQuery).trim();
+  return buildSerpApiQueryPlan_(bestSearchQuery, upc, title, brand).primaryQuery;
+}
 
-  let q = `${brand || ''} ${title || ''}`.trim();
-  q = q.replace(/\s+/g, ' ');
+function buildSerpApiQueryPlan_(bestSearchQuery, upc, title, brand) {
+  const queries = [];
+  const seen = {};
+  const cleanProductQuery = buildCleanProductNameQuery_(title, brand);
+  const shortenedProductQuery = buildShortProductNameQuery_(title, brand);
+  const fallbackQuery = buildLegacyProductQuery_(bestSearchQuery, brand);
+  const upcQuery = buildUpcFallbackQuery_(upc);
 
-  return q;
+  addSerpApiQueryAttempt_(queries, seen, cleanProductQuery, 'product_title', 'Product title/name', false);
+  addSerpApiQueryAttempt_(queries, seen, shortenedProductQuery, 'brand_short_title', 'Brand + shortened product title', false);
+
+  if (!queries.length) {
+    addSerpApiQueryAttempt_(queries, seen, fallbackQuery, 'legacy_product_query', 'Existing product-name query', false);
+  }
+
+  addSerpApiQueryAttempt_(queries, seen, upcQuery, 'upc_fallback', 'UPC/GTIN fallback', true);
+
+  return {
+    strategy: 'product-name-first',
+    primaryQuery: queries.length ? queries[0].query : '',
+    queries
+  };
+}
+
+function addSerpApiQueryAttempt_(queries, seen, query, type, label, usesUpcFallback) {
+  const cleanQuery = cleanSearchQueryText_(query);
+  const key = normalize_(cleanQuery);
+  if (!cleanQuery || seen[key]) return;
+
+  seen[key] = true;
+  queries.push({
+    query: cleanQuery,
+    type,
+    label,
+    usesUpcFallback: Boolean(usesUpcFallback)
+  });
+}
+
+function buildCleanProductNameQuery_(title, brand) {
+  const cleanBrand = cleanSearchQueryText_(brand);
+  const cleanTitle = cleanProductTitleForSearch_(title, brand);
+  const titleNorm = normalize_(cleanTitle);
+  const brandNorm = normalize_(cleanBrand);
+  const parts = [];
+
+  if (cleanBrand && titleNorm !== brandNorm && !titleNorm.startsWith(`${brandNorm} `)) {
+    parts.push(cleanBrand);
+  }
+  if (cleanTitle) parts.push(cleanTitle);
+
+  const query = cleanSearchQueryText_(parts.join(' '));
+  return isBrandOnlySearchQuery_(query, cleanBrand) ? '' : query;
+}
+
+function buildShortProductNameQuery_(title, brand) {
+  const cleanBrand = cleanSearchQueryText_(brand);
+  const cleanTitle = cleanProductTitleForSearch_(title, brand);
+  const tokens = cleanTitle.split(' ').filter(Boolean);
+  const keepIndexes = {};
+  const kept = [];
+
+  tokens.forEach((token, idx) => {
+    if (idx < 9 || isImportantVariantToken_(token, tokens[idx - 1], tokens[idx + 1])) {
+      keepIndexes[idx] = true;
+    }
+  });
+
+  Object.keys(keepIndexes)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .slice(0, 16)
+    .forEach(idx => kept.push(tokens[idx]));
+
+  const shortTitle = kept.join(' ');
+  const titleNorm = normalize_(shortTitle);
+  const brandNorm = normalize_(cleanBrand);
+  const parts = [];
+
+  if (cleanBrand && titleNorm !== brandNorm && !titleNorm.startsWith(`${brandNorm} `)) {
+    parts.push(cleanBrand);
+  }
+  if (shortTitle) parts.push(shortTitle);
+
+  const query = cleanSearchQueryText_(parts.join(' '));
+  return isBrandOnlySearchQuery_(query, cleanBrand) ? '' : query;
+}
+
+function buildLegacyProductQuery_(bestSearchQuery, brand) {
+  if (looksLikeIdentifierOnly_(bestSearchQuery)) return '';
+
+  const query = cleanSearchQueryText_(bestSearchQuery);
+  return isBrandOnlySearchQuery_(query, brand) ? '' : query;
+}
+
+function buildUpcFallbackQuery_(upc) {
+  const identifiers = getProductIdentifiers_(upc);
+  return identifiers.length ? identifiers[0] : '';
+}
+
+function cleanProductTitleForSearch_(title, brand) {
+  const brandNorm = normalize_(brand);
+  let clean = String(title || '');
+
+  clean = clean
+    .replace(/\bamazon(?:\.com)?\b/gi, ' ')
+    .replace(/\bamazon'?s choice\b/gi, ' ')
+    .replace(/\bchoice product\b/gi, ' ')
+    .replace(/\bbest seller\b/gi, ' ')
+    .replace(/\bsponsored\b/gi, ' ')
+    .replace(/\bprime eligible\b/gi, ' ')
+    .replace(/\bprime\b/gi, ' ')
+    .replace(/\bfree (shipping|delivery|returns?)\b/gi, ' ')
+    .replace(/\bships from amazon\b/gi, ' ')
+    .replace(/\bsold by amazon\b/gi, ' ')
+    .replace(/\bfulfilled by amazon\b/gi, ' ')
+    .replace(/\bvisit the .*? store\b/gi, ' ')
+    .replace(/\bbrand\s*:\s*/gi, ' ')
+    .replace(/\bASIN\s*:?\s*B0[A-Z0-9]{8}\b/gi, ' ');
+
+  clean = cleanSearchQueryText_(clean);
+
+  if (brandNorm && normalize_(clean) === brandNorm) return '';
+  return clean;
+}
+
+function cleanSearchQueryText_(value) {
+  return String(value || '')
+    .replace(/[\u2122\u00ae\u00a9]/g, ' ')
+    .replace(/[|\u2022\u00b7*_~]+/g, ' ')
+    .replace(/["'`]+/g, '')
+    .replace(/[()[\]{}<>]+/g, ' ')
+    .replace(/[^a-zA-Z0-9.%+/#& -]/g, ' ')
+    .replace(/\s*[-\u2013\u2014]\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isBrandOnlySearchQuery_(query, brand) {
+  const q = normalize_(query);
+  const b = normalize_(brand);
+  if (!q) return true;
+  if (!b) return false;
+
+  const brandWords = {};
+  b.split(' ').forEach(word => {
+    if (word) brandWords[word] = true;
+  });
+
+  return q.split(' ').every(word => brandWords[word]);
+}
+
+function looksLikeIdentifierOnly_(value) {
+  const raw = String(value || '').trim();
+  const digits = normalizeIdentifier_(raw);
+  return Boolean(digits && digits.length >= 8 && digits.length <= 14 && /^[0-9\s-]+$/.test(raw));
+}
+
+function isImportantVariantToken_(token, previousToken, nextToken) {
+  const t = normalize_(token);
+  const prev = normalize_(previousToken);
+  const next = normalize_(nextToken);
+  if (!t) return false;
+  if (/\d/.test(t)) return true;
+  if (/^(oz|ounce|ounces|lb|lbs|pound|pounds|g|gram|grams|kg|ml|l|liter|liters|ct|count|pack|packs|pk|piece|pieces|pc|pcs|inch|inches|in|ft|feet|size|fl|fluid|model|series|gen|generation)$/i.test(t)) return true;
+  if (/^(black|white|gray|grey|silver|gold|blue|navy|red|green|yellow|orange|purple|pink|brown|tan|beige|clear|natural|vanilla|chocolate|strawberry|mint|lemon|lime|berry|cherry|grape|unscented|scented)$/i.test(t)) return true;
+  if ((prev && /\d/.test(prev)) || (next && /\d/.test(next))) {
+    return /^(oz|ct|count|pack|pk|inch|in|ft|ml|g|lb|lbs|piece|pc)$/i.test(t);
+  }
+  return false;
 }
 
 function processSerpApiRow_(sheet, rowObj, apiKey) {
-  const result = searchGoogleShopping_(rowObj.query, apiKey);
-  const best = pickBestShoppingResult_(result.shopping_results || [], rowObj);
+  const searchOutcome = runSerpApiQueryPlan_(rowObj, apiKey);
+  const best = searchOutcome.best;
 
   const now = new Date();
 
   if (!best) {
+    const notes = buildNoSerpApiResultNotes_(rowObj, searchOutcome);
+
     sheet.getRange(rowObj.rowNumber, 24, 1, 7).setValues([[
       '',
       '',
       '',
       '',
       'No result',
-      'No clean shopping result found under max buy cost.',
+      notes,
       now
     ]]);
 
@@ -755,14 +1053,20 @@ function processSerpApiRow_(sheet, rowObj, apiKey) {
       '',
       'Reject',
       'No',
-      'No credible profitable source found under max buy cost.'
+      notes
     ]]);
     writeOpportunitySignals_(sheet, rowObj.rowNumber, buildOpportunitySignals_(rowObj, null));
 
-    return { decision: 'No' };
+    return {
+      decision: 'No',
+      usedProductTitleSearch: searchOutcome.usedProductTitleSearch,
+      usedUpcFallback: searchOutcome.usedUpcFallback,
+      rejectedDueToUpcTitleMismatch: false
+    };
   }
 
   const profitCheck = best.price <= rowObj.maxBuyCost ? 'Under Max Buy Cost' : 'Above Max Buy Cost';
+  best.notes = buildSerpApiResultNotes_(rowObj, best, profitCheck);
 
   sheet.getRange(rowObj.rowNumber, 24, 1, 7).setValues([[
     best.title,
@@ -779,7 +1083,7 @@ function processSerpApiRow_(sheet, rowObj, apiKey) {
 
   const isCleanProfitable =
     best.price <= rowObj.maxBuyCost &&
-    best.matchConfidence !== 'Low' &&
+    isAcceptableMatchConfidence_(best.matchConfidence) &&
     !isRiskySource_(best.source) &&
     !isRiskyProduct_(rowObj.title, rowObj.brand);
 
@@ -793,7 +1097,12 @@ function processSerpApiRow_(sheet, rowObj, apiKey) {
       `Auto-approved clean profitable source. ${best.notes}`
     ]]);
 
-    return { decision: 'Yes' };
+    return {
+      decision: 'Yes',
+      usedProductTitleSearch: searchOutcome.usedProductTitleSearch,
+      usedUpcFallback: searchOutcome.usedUpcFallback,
+      rejectedDueToUpcTitleMismatch: false
+    };
   }
 
   const isAmbiguousPromising = isPromisingButIncomplete_(best, rowObj);
@@ -812,7 +1121,65 @@ function processSerpApiRow_(sheet, rowObj, apiKey) {
     notes
   ]]);
 
-  return { decision: moveStatus };
+  return {
+    decision: moveStatus,
+    usedProductTitleSearch: searchOutcome.usedProductTitleSearch,
+    usedUpcFallback: searchOutcome.usedUpcFallback,
+    rejectedDueToUpcTitleMismatch: moveStatus === 'No' && Boolean(best.rejectedDueToUpcTitleMismatch)
+  };
+}
+
+function runSerpApiQueryPlan_(rowObj, apiKey) {
+  const plan = rowObj.queryPlan || buildSerpApiQueryPlan_('', rowObj.upc, rowObj.title, rowObj.brand);
+  let usedProductTitleSearch = false;
+  let usedUpcFallback = false;
+  let selected = null;
+  let bestCredible = null;
+  let bestOverall = null;
+  const attempts = [];
+
+  plan.queries.forEach(queryAttempt => {
+    if (selected) return;
+
+    const result = searchGoogleShopping_(queryAttempt.query, apiKey);
+    const shoppingResults = result.shopping_results || [];
+    const bestForAttempt = pickBestShoppingResult_(shoppingResults, rowObj, queryAttempt, plan);
+
+    if (queryAttempt.type === 'product_title') usedProductTitleSearch = true;
+    if (queryAttempt.usesUpcFallback) usedUpcFallback = true;
+
+    attempts.push({
+      query: queryAttempt.query,
+      type: queryAttempt.type,
+      label: queryAttempt.label,
+      resultCount: shoppingResults.length,
+      bestConfidence: bestForAttempt ? bestForAttempt.matchConfidence : 'No result'
+    });
+
+    if (!bestForAttempt) return;
+
+    if (!bestOverall || getShoppingCandidateRank_(bestForAttempt, rowObj) > getShoppingCandidateRank_(bestOverall, rowObj)) {
+      bestOverall = bestForAttempt;
+    }
+
+    if (isAcceptableMatchConfidence_(bestForAttempt.matchConfidence)) {
+      if (!bestCredible || getShoppingCandidateRank_(bestForAttempt, rowObj) > getShoppingCandidateRank_(bestCredible, rowObj)) {
+        bestCredible = bestForAttempt;
+      }
+
+      if (bestForAttempt.price <= rowObj.maxBuyCost) {
+        selected = bestForAttempt;
+      }
+    }
+  });
+
+  return {
+    best: selected || bestCredible || bestOverall,
+    attempts,
+    plan,
+    usedProductTitleSearch,
+    usedUpcFallback
+  };
 }
 
 function searchGoogleShopping_(query, apiKey) {
@@ -847,7 +1214,7 @@ function searchGoogleShopping_(query, apiKey) {
   return json;
 }
 
-function pickBestShoppingResult_(shoppingResults, rowObj) {
+function pickBestShoppingResult_(shoppingResults, rowObj, queryAttempt, queryPlan) {
   if (!shoppingResults || !shoppingResults.length) return null;
 
   const scored = shoppingResults
@@ -859,22 +1226,23 @@ function pickBestShoppingResult_(shoppingResults, rowObj) {
 
       if (!price || !title) return null;
 
-      const matchSignals = getShoppingMatchSignals_(title, source, rowObj);
+      const matchSignals = getShoppingMatchSignals_(title, source, rowObj, item, queryAttempt);
       const matchScore = matchSignals.score;
       const priceScore = price <= rowObj.maxBuyCost ? 40 : 0;
       const sourcePenalty = isRiskySource_(source) ? -25 : 0;
       const totalScore = matchScore + priceScore + sourcePenalty;
-
-      let matchConfidence = 'Low';
-      if (totalScore >= 75) matchConfidence = 'High';
-      else if (totalScore >= 50) matchConfidence = 'Medium';
+      const matchConfidence = matchSignals.matchConfidence;
 
       const notes = [
+        `Query used: ${queryAttempt ? queryAttempt.query : rowObj.query}`,
+        `Query type: ${queryAttempt ? queryAttempt.label : 'Product search'}`,
         `Matched title: ${title}`,
         `Source: ${source || 'Unknown'}`,
         `Price: $${price.toFixed(2)}`,
         `Max Buy Cost: $${rowObj.maxBuyCost.toFixed(2)}`,
-        `Confidence: ${matchConfidence}`
+        `Confidence: ${matchConfidence}`,
+        `UPC validation: ${matchSignals.upcValidationStatus}`,
+        `Match reason: ${matchSignals.matchReason}`
       ].join(' | ');
 
       return {
@@ -886,59 +1254,367 @@ function pickBestShoppingResult_(shoppingResults, rowObj) {
         totalScore,
         matchConfidence,
         upcMatched: matchSignals.upcMatched,
+        upcValidationStatus: matchSignals.upcValidationStatus,
+        upcMismatched: matchSignals.upcMismatched,
+        rejectedDueToUpcTitleMismatch: matchSignals.rejectedDueToUpcTitleMismatch,
         brandMatched: matchSignals.brandMatched,
+        variantMatched: matchSignals.variantMatched,
+        variantOverlap: matchSignals.variantOverlap,
         titleOverlap: matchSignals.titleOverlap,
         titleWordsChecked: matchSignals.titleWordsChecked,
+        matchReason: matchSignals.matchReason,
+        rejectionReasons: matchSignals.rejectionReasons,
+        queryUsed: queryAttempt ? queryAttempt.query : rowObj.query,
+        queryType: queryAttempt ? queryAttempt.type : '',
+        queryLabel: queryAttempt ? queryAttempt.label : '',
+        usedUpcFallback: Boolean(queryAttempt && queryAttempt.usesUpcFallback),
+        queryStrategy: queryPlan ? queryPlan.strategy : 'product-name-first',
         notes
       };
     })
     .filter(Boolean)
-    .sort((a, b) => b.totalScore - a.totalScore || a.price - b.price);
+    .sort((a, b) => getShoppingCandidateRank_(b, rowObj) - getShoppingCandidateRank_(a, rowObj) || a.price - b.price);
 
   if (!scored.length) return null;
 
   return scored[0];
 }
 
-function getShoppingMatchSignals_(resultTitle, source, rowObj) {
-  const result = normalize_(resultTitle);
-  const title = normalize_(rowObj.title);
+function getShoppingMatchSignals_(resultTitle, source, rowObj, item, queryAttempt) {
+  const identityText = buildShoppingResultIdentityText_(item, resultTitle, source);
+  const result = normalize_(identityText);
+  const resultTitleNorm = normalize_(resultTitle);
   const brand = normalize_(rowObj.brand);
-  const upc = normalize_(rowObj.upc);
-
-  let score = 0;
+  const rowIdentifiers = getProductIdentifiers_(rowObj.upc);
+  const visibleIdentifiers = getLabeledProductIdentifiers_(identityText);
+  const upcMatched = rowIdentifiers.some(identifier => identityContainsIdentifier_(identityText, identifier));
+  const upcMismatched = Boolean(rowIdentifiers.length && visibleIdentifiers.length && !visibleIdentifiers.some(identifier => rowIdentifiers.indexOf(identifier) !== -1));
+  const upcValidationStatus = !rowIdentifiers.length
+    ? 'not provided'
+    : upcMatched
+      ? 'match'
+      : upcMismatched
+        ? 'mismatch'
+        : 'not visible';
   const brandMatched = Boolean(brand && result.includes(brand));
-  const upcMatched = Boolean(upc && result.includes(upc));
-
-  if (brandMatched) score += 25;
-  if (upcMatched) score += 45;
-
-  const titleWords = title
-    .split(' ')
-    .filter(w => w.length >= 4)
-    .slice(0, 12);
+  const titleWords = getProductTitleMatchTokens_(rowObj.title, rowObj.brand);
+  const variantTokens = getImportantTitleVariantTokens_(rowObj.title);
+  const numericVariantTokens = getNumericVariantTokens_(rowObj.title);
+  const resultNumericVariantTokens = getNumericVariantTokens_(resultTitle);
 
   let matchedWords = 0;
+  let matchedVariants = 0;
+  let matchedNumericVariants = 0;
 
   titleWords.forEach(w => {
-    if (result.includes(w)) matchedWords++;
+    if (resultTitleNorm.includes(w) || result.includes(w)) matchedWords++;
   });
 
-  score += Math.min(35, matchedWords * 5);
+  variantTokens.forEach(w => {
+    if (resultTitleNorm.includes(w) || result.includes(w)) matchedVariants++;
+  });
 
-  if (source && !isRiskySource_(source)) score += 10;
+  numericVariantTokens.forEach(w => {
+    if (resultTitleNorm.includes(w) || result.includes(w)) matchedNumericVariants++;
+  });
+
+  const titleOverlap = titleWords.length ? matchedWords / titleWords.length : 0;
+  const variantOverlap = variantTokens.length ? matchedVariants / variantTokens.length : 1;
+  const numericVariantOverlap = numericVariantTokens.length ? matchedNumericVariants / numericVariantTokens.length : 1;
+  const sourceCredible = Boolean(source && !isRiskySource_(source));
+  const strongTitleMatch = titleOverlap >= 0.6 && matchedWords >= Math.min(4, titleWords.length || 4);
+  const veryStrongTitleMatch = titleOverlap >= 0.82 && matchedWords >= Math.min(6, titleWords.length || 6);
+  const brandTitleStrong = strongTitleMatch && (brandMatched || !brand || veryStrongTitleMatch);
+  const variantMatched = variantOverlap >= 0.45 || variantTokens.length < 2;
+  const variantMismatch = numericVariantTokens.length > 0 &&
+    resultNumericVariantTokens.length > 0 &&
+    numericVariantOverlap === 0 &&
+    titleOverlap < 0.75;
+  const upcFallbackWithoutTitleMatch = Boolean(queryAttempt && queryAttempt.usesUpcFallback && !brandTitleStrong);
+  const rejectedDueToUpcTitleMismatch = Boolean(upcMismatched || upcFallbackWithoutTitleMatch);
+  const rejectionReasons = [];
+
+  if (upcMismatched) rejectionReasons.push('visible UPC/GTIN does not match source product');
+  if (upcFallbackWithoutTitleMatch) rejectionReasons.push('UPC fallback result does not match product title/brand strongly enough');
+  if (brand && !brandMatched && !veryStrongTitleMatch) rejectionReasons.push('brand not confirmed');
+  if (!strongTitleMatch) rejectionReasons.push('weak title overlap');
+  if (variantMismatch || !variantMatched) rejectionReasons.push('wrong or missing variant details');
+  if (!sourceCredible) rejectionReasons.push('risky or missing retailer source');
+
+  let score = 0;
+  if (brandMatched) score += 25;
+  score += Math.min(45, Math.round(titleOverlap * 45));
+  if (variantMatched) score += 10;
+  if (upcMatched) score += 25;
+  if (sourceCredible) score += 10;
+  if (upcMismatched) score -= 60;
+  if (upcFallbackWithoutTitleMatch) score -= 45;
+  if (variantMismatch) score -= 25;
+  if (brand && !brandMatched && !veryStrongTitleMatch) score -= 15;
+
+  let matchConfidence = 'Low';
+
+  if (rejectedDueToUpcTitleMismatch || variantMismatch) {
+    matchConfidence = 'Reject';
+  } else if ((upcMatched && brandTitleStrong && variantMatched) || (veryStrongTitleMatch && variantMatched && sourceCredible)) {
+    matchConfidence = 'High';
+  } else if (brandTitleStrong && variantMatched) {
+    matchConfidence = 'Medium';
+  }
+
+  const matchReason = buildMatchReason_({
+    matchConfidence,
+    brandMatched,
+    titleOverlap,
+    variantOverlap,
+    upcValidationStatus,
+    sourceCredible,
+    rejectionReasons
+  });
 
   return {
-    score,
+    score: Math.max(0, score),
+    matchConfidence,
     upcMatched,
+    upcValidationStatus,
+    upcMismatched,
+    rejectedDueToUpcTitleMismatch,
     brandMatched,
-    titleOverlap: titleWords.length ? matchedWords / titleWords.length : 0,
-    titleWordsChecked: titleWords.length
+    variantMatched,
+    variantOverlap,
+    titleOverlap,
+    titleWordsChecked: titleWords.length,
+    matchReason,
+    rejectionReasons
   };
 }
 
 function scoreShoppingMatch_(resultTitle, source, rowObj) {
   return getShoppingMatchSignals_(resultTitle, source, rowObj).score;
+}
+
+function getShoppingCandidateRank_(candidate, rowObj) {
+  const confidenceRank = {
+    High: 3,
+    Medium: 2,
+    Low: 1,
+    Reject: 0
+  };
+  const rank = confidenceRank[candidate.matchConfidence] || 0;
+  const priceRank = candidate.price <= rowObj.maxBuyCost ? 1 : 0;
+  return (rank * 1000) + (priceRank * 100) + candidate.totalScore;
+}
+
+function isAcceptableMatchConfidence_(confidence) {
+  return confidence === 'High' || confidence === 'Medium';
+}
+
+function buildShoppingResultIdentityText_(item, resultTitle, source) {
+  const parts = [];
+  const push = value => {
+    if (value === null || value === undefined || value === '') return;
+    if (Array.isArray(value)) {
+      value.forEach(push);
+      return;
+    }
+    if (typeof value === 'object') {
+      Object.keys(value).forEach(key => {
+        push(key);
+        push(value[key]);
+      });
+      return;
+    }
+    parts.push(String(value));
+  };
+
+  push(resultTitle);
+  push(source);
+
+  if (item) {
+    push(item.title);
+    push(item.source);
+    push(item.merchant);
+    push(item.snippet);
+    push(item.description);
+    push(item.extensions);
+    push(item.detected_extensions);
+    push(item.product_id);
+    push(item.product_link);
+    push(item.link);
+  }
+
+  return parts.join(' ');
+}
+
+function getProductTitleMatchTokens_(title, brand) {
+  const brandWords = {};
+  normalize_(brand).split(' ').forEach(word => {
+    if (word) brandWords[word] = true;
+  });
+
+  const tokens = cleanProductTitleForSearch_(title, brand)
+    .split(' ')
+    .map(token => normalize_(token))
+    .filter(token => token && token.length >= 3 && !brandWords[token] && !isGenericTitleToken_(token));
+  const selected = [];
+  const seen = {};
+
+  tokens.forEach((token, idx) => {
+    if (seen[token]) return;
+    if (selected.length < 14 || isImportantVariantToken_(token, tokens[idx - 1], tokens[idx + 1])) {
+      seen[token] = true;
+      selected.push(token);
+    }
+  });
+
+  return selected.slice(0, 20);
+}
+
+function getImportantTitleVariantTokens_(title) {
+  const tokens = cleanProductTitleForSearch_(title, '')
+    .split(' ')
+    .map(token => normalize_(token))
+    .filter(Boolean);
+  const selected = [];
+  const seen = {};
+
+  tokens.forEach((token, idx) => {
+    if (seen[token]) return;
+    if (isImportantVariantToken_(token, tokens[idx - 1], tokens[idx + 1])) {
+      seen[token] = true;
+      selected.push(token);
+    }
+  });
+
+  return selected.slice(0, 14);
+}
+
+function getNumericVariantTokens_(text) {
+  const tokens = cleanSearchQueryText_(text)
+    .split(' ')
+    .map(token => normalize_(token))
+    .filter(token => token && /\d/.test(token));
+  const selected = [];
+  const seen = {};
+
+  tokens.forEach(token => {
+    if (!seen[token]) {
+      seen[token] = true;
+      selected.push(token);
+    }
+  });
+
+  return selected.slice(0, 12);
+}
+
+function isGenericTitleToken_(token) {
+  return /^(the|and|with|for|from|your|you|new|sale|free|shipping|delivery|amazon|prime|store|official|genuine|original|product|products|item|items|packaging)$/.test(token);
+}
+
+function getProductIdentifiers_(value) {
+  const raw = String(value || '');
+  const identifiers = [];
+  const seen = {};
+  const compact = normalizeIdentifier_(raw);
+  const matches = raw.match(/\d{8,14}/g) || [];
+
+  if (compact.length >= 8 && compact.length <= 14) matches.push(compact);
+
+  matches.forEach(match => {
+    const identifier = normalizeIdentifier_(match);
+    if (identifier.length >= 8 && identifier.length <= 14 && !seen[identifier]) {
+      seen[identifier] = true;
+      identifiers.push(identifier);
+    }
+  });
+
+  return identifiers;
+}
+
+function getLabeledProductIdentifiers_(text) {
+  const identifiers = [];
+  const seen = {};
+  const regex = /(?:upc|gtin|ean|barcode|bar code)[^0-9]{0,24}([0-9][0-9\s-]{6,22}[0-9])/gi;
+  let match;
+
+  while ((match = regex.exec(String(text || ''))) !== null) {
+    const identifier = normalizeIdentifier_(match[1]);
+    if (identifier.length >= 8 && identifier.length <= 14 && !seen[identifier]) {
+      seen[identifier] = true;
+      identifiers.push(identifier);
+    }
+  }
+
+  return identifiers;
+}
+
+function identityContainsIdentifier_(text, identifier) {
+  const cleanIdentifier = normalizeIdentifier_(identifier);
+  if (!cleanIdentifier) return false;
+
+  const regex = new RegExp('(^|\\D)' + cleanIdentifier + '(\\D|$)');
+  return regex.test(String(text || ''));
+}
+
+function normalizeIdentifier_(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function buildMatchReason_(data) {
+  const parts = [];
+
+  parts.push(`title overlap ${Math.round((data.titleOverlap || 0) * 100)}%`);
+  parts.push(data.brandMatched ? 'brand confirmed' : 'brand not confirmed');
+  parts.push(`variant overlap ${Math.round((data.variantOverlap || 0) * 100)}%`);
+  parts.push(`UPC/GTIN ${data.upcValidationStatus}`);
+  parts.push(data.sourceCredible ? 'credible retailer' : 'risky/missing retailer');
+
+  if (data.rejectionReasons && data.rejectionReasons.length) {
+    parts.push(`reject signals: ${data.rejectionReasons.join(', ')}`);
+  }
+
+  return parts.join('; ');
+}
+
+function buildSerpApiResultNotes_(rowObj, best, profitCheck) {
+  const profitText = `${profitCheck}: source $${best.price.toFixed(2)} vs max buy $${rowObj.maxBuyCost.toFixed(2)}`;
+  const upcUse = best.usedUpcFallback
+    ? `UPC used as fallback query and validation (${best.upcValidationStatus})`
+    : `UPC used as validation only (${best.upcValidationStatus})`;
+  const parts = [
+    `Query used: ${best.queryUsed || rowObj.query}`,
+    `Search strategy: ${best.queryStrategy || 'product-name-first'}; ${best.queryLabel || 'Product title/name'}`,
+    upcUse,
+    `Match reason: ${best.matchReason}`,
+    `Profit check versus Max Buy Cost: ${profitText}`,
+    `Matched title: ${best.title}`,
+    `Source: ${best.source || 'Unknown'}`,
+    `Confidence: ${best.matchConfidence}`
+  ];
+
+  if (best.rejectionReasons && best.rejectionReasons.length) {
+    parts.push(`Rejection reason: ${best.rejectionReasons.join(', ')}`);
+  }
+
+  return parts.join(' | ');
+}
+
+function buildNoSerpApiResultNotes_(rowObj, searchOutcome) {
+  const attempts = (searchOutcome.attempts || [])
+    .map(attempt => `${attempt.label}: "${attempt.query}" (${attempt.bestConfidence}; ${attempt.resultCount} results)`)
+    .join('; ');
+  const upcUse = searchOutcome.usedUpcFallback
+    ? 'UPC fallback was attempted after product-name searches.'
+    : 'UPC was not used as the primary query.';
+
+  return [
+    `Query strategy: product-name-first`,
+    attempts ? `Queries used: ${attempts}` : `No SerpApi query could be built from product title/name.`,
+    upcUse,
+    `Match reason: no credible shopping result found`,
+    `Profit check versus Max Buy Cost: no source price to compare against max buy $${rowObj.maxBuyCost.toFixed(2)}`,
+    `Rejection reason: no credible profitable source found`
+  ].join(' | ');
 }
 
 function isRiskySource_(source) {
@@ -958,6 +1634,7 @@ function isRiskyProduct_(title, brand, category) {
 function isPromisingButIncomplete_(best, rowObj) {
   if (best.price > rowObj.maxBuyCost) return false;
   if (isRiskySource_(best.source) || isRiskyProduct_(rowObj.title, rowObj.brand)) return false;
+  if (best.matchConfidence === 'Reject' || best.rejectedDueToUpcTitleMismatch) return false;
 
   const hasIncompleteIdentity = !rowObj.upc || !rowObj.brand || !rowObj.title;
   return hasIncompleteIdentity && best.matchConfidence === 'Low';
@@ -967,12 +1644,18 @@ function buildAutoRejectNotes_(best, rowObj, profitCheck) {
   const reasons = [];
 
   if (best.price > rowObj.maxBuyCost) reasons.push('above max buy cost');
-  if (best.matchConfidence === 'Low') reasons.push('low match confidence');
+  if (!isAcceptableMatchConfidence_(best.matchConfidence)) reasons.push('low match confidence');
+  if (best.rejectedDueToUpcTitleMismatch) reasons.push('UPC/title mismatch');
+  if (best.rejectionReasons && best.rejectionReasons.length) {
+    best.rejectionReasons.forEach(reason => {
+      if (reasons.indexOf(reason) === -1) reasons.push(reason);
+    });
+  }
   if (isRiskySource_(best.source)) reasons.push('risky source');
   if (isRiskyProduct_(rowObj.title, rowObj.brand)) reasons.push('risky product');
 
   const reasonText = reasons.length ? reasons.join(', ') : 'not a credible profitable source';
-  return `Auto-rejected: ${reasonText}. ${profitCheck}.`;
+  return `Auto-rejected: ${reasonText}. ${profitCheck}. ${best.notes}`;
 }
 
 
@@ -1007,6 +1690,7 @@ function buildOpportunitySignals_(rowObj, best) {
   score += Math.min(10, Math.round((best.titleOverlap || 0) * 10));
   if (legitimateRetailer) score += 10;
   if (!productAllowed) score -= 30;
+  if (best.matchConfidence === 'Reject' || best.rejectedDueToUpcTitleMismatch) score = Math.min(score, 20);
 
   return {
     score: Math.max(0, Math.min(100, score)),
@@ -1044,9 +1728,10 @@ function buildVelocitySignal_(rowObj) {
 function buildMatchSignal_(best, legitimateRetailer, productAllowed) {
   const parts = [
     best.matchConfidence,
-    best.upcMatched ? 'UPC match' : 'UPC not confirmed',
+    `UPC/GTIN ${best.upcValidationStatus || (best.upcMatched ? 'match' : 'not confirmed')}`,
     best.brandMatched ? 'brand match' : 'brand not confirmed',
     `title overlap ${Math.round((best.titleOverlap || 0) * 100)}%`,
+    `variant overlap ${Math.round((best.variantOverlap === undefined ? 1 : best.variantOverlap) * 100)}%`,
     legitimateRetailer ? 'legitimate retailer' : 'risky source',
     productAllowed ? 'allowed product' : 'risky product'
   ];
@@ -1233,18 +1918,7 @@ function getKeepaSelection_() {
     return JSON.parse(raw);
   }
 
-  return {
-    f: {
-      productType: {
-        values: ['0'],
-        filterType: 'set'
-      }
-    },
-    s: [
-      { colId: 'SALES_current', sort: 'asc' }
-    ],
-    t: 'g'
-  };
+  return getDefaultKeepaSelection_();
 }
 
 /************************************************************
