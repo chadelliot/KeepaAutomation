@@ -28,6 +28,7 @@ SerpApi processing writes decisions into columns O:T for every searched row:
 - High-confidence profitable source matches are marked `Yes`.
 - Medium-confidence profitable source matches are marked `Yes`.
 - Low-confidence matches are marked `No` unless the row is promising but missing enough data to justify a short `Review` hold.
+- SerpApi searches use product title/name first, then brand plus a shortened title when needed. UPC/GTIN is used after results return as a validation signal, with UPC fallback only after product-name searches fail to produce a credible match.
 - No source found, source price above Max Buy Cost, risky sources, risky products, gift cards, subscriptions, renewed/refurbished electronics, and Amazon-to-Amazon resale are marked `No`.
 - Search errors are marked `No` with concise notes so O:T is not left blank.
 
@@ -57,7 +58,7 @@ Brand diversity is a discovery control only: it does **not** override profitabil
 
 `KEEPA_MAX_NEW_PRODUCTS_PER_BRAND` means no more than 5 viable new products per normalized brand are appended per Keepa run by default. Duplicate or weak products do not count toward the 5. Once 5 viable products are selected for a brand, additional products from that brand are skipped and the scan continues looking for other brands while the scan and token guard allow it.
 
-If the current Keepa query page is dominated by brands that have already hit the per-run cap, the scanner can continue into deeper Keepa query pages until it appends the hourly target, reaches the diversity scan limit, or stops because Keepa/API behavior or token availability would require additional unexpected calls. Run Log entries include Keepa pages scanned, page numbers scanned, products scanned, profit/margin/velocity/competition/sourceability/score rejections, candidates deduped, candidates passing pre-ingestion score, candidates skipped as weak, qualified products inserted, brand-cap skips, selected count by brand, token-limit stop/warning, and whether deeper page scanning was used.
+If the current Keepa query page is dominated by brands that have already hit the per-run cap, the scanner can continue into deeper Keepa query pages until it appends the hourly target, reaches the diversity scan limit, receives an empty ASIN response, or stops because Keepa/API behavior or token availability would require additional unexpected calls. The scanner uses `KEEPA_QUERY_PAGE` as a forward-only page cursor: each run starts from the stored page and saves the next page after the last attempted page. It does not wrap back to page 0 because of a fixed max page cap. It resets to page 0 only when `KEEPA_SELECTION_JSON` changes or `resetKeepaRotation()` is run manually. Run Log entries include starting page, page numbers scanned, number of pages scanned, next page saved, whether selection JSON reset the cursor, products scanned, profit/margin/velocity/competition/sourceability/score rejections, candidates deduped, candidates passing pre-ingestion score, candidates skipped as weak, qualified products inserted, brand-cap skips, selected count by brand, token-limit stop/warning, no-ASIN status, and whether deeper page scanning was used.
 
 `Source Link Finder` should only receive pre-qualified Keepa rows. During queue refill, Keepa-shaped rows from `Source Search Queue` are allowed through only when they still show `Keepa Opportunity Score >= 70` and `Status = QUALIFIED`; duplicate ASIN/UPC rows are removed, while rows skipped only because of the active Source Link Finder brand cap remain queued for a later pass.
 
@@ -78,6 +79,7 @@ If the current Keepa query page is dominated by brands that have already hit the
 | Property | Default | Purpose |
 | --- | ---: | --- |
 | `KEEPA_MAX_NEW_PRODUCTS_PER_BRAND` | `5` | Maximum new Daily Keepa Pull products appended per normalized brand per Keepa scan run, after dedupe and opportunity filtering. |
+| `KEEPA_QUERY_PAGE` | `0` | Forward-only Keepa page cursor for the next hourly scan. Use `setNextKeepaPageTo40()` to start the next run at page 40, or `resetKeepaRotation()` to reset to page 0. |
 | `KEEPA_BRAND_DIVERSITY_SCAN_LIMIT` | `250` | Maximum Keepa candidates evaluated per run while searching deeper pages for qualified, diverse products. |
 | `KEEPA_MIN_TOKENS_TO_CONTINUE` | `50` | Minimum Keepa token balance required before deeper scanning continues. Low tokens or HTTP 429 stops the scan gracefully and logs a warning. |
 | `SOURCE_LINK_FINDER_BATCH_LIMIT` | `100` | Maximum eligible rows moved from `Source Search Queue` into `Source Link Finder` per refill run. This is a per-run batch limit, not a total Source Link Finder cap. |
