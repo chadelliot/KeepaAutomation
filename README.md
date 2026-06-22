@@ -49,13 +49,17 @@ Source scoring happens later, after a source URL and source price are found. It 
 
 ## Daily Keepa Pull brand diversity
 
-`runKeepaHourlyScan()` applies pre-ingestion scoring and brand diversity before rows are written to `Daily Keepa Pull`. Keepa candidates are deduped by ASIN/UPC across the workbook, scored using only available Keepa/product data, screened for profitability, velocity, product-quality, and risk signals, then grouped by normalized brand so one brand cannot consume the whole hourly batch.
+`runKeepaHourlyScan()` applies pre-ingestion scoring and brand diversity before rows are written to `Daily Keepa Pull`. Keepa candidates are deduped by ASIN/UPC across the workbook, scored using only available Keepa/product data, screened for profitability, velocity, product-quality, competition/stock, and sourceability/risk signals, then grouped by normalized brand so one brand cannot consume the whole hourly batch.
 
-Brand diversity is a discovery control only: it does **not** override profitability or velocity requirements. Weak products, duplicates, products without a likely sell price / max-buy-cost potential, products below the estimated 15% margin or $2 profit thresholds when calculable, weak velocity candidates, gift cards, subscriptions, apps/downloads, renewed/refurbished electronics, and restricted/risky brands are skipped before any brand slot is consumed.
+Only products with `Keepa Opportunity Score >= 70`, estimated profit of at least `$2`, and estimated margin of at least `15%` are eligible to move forward. The Keepa score is weighted as velocity `30%`, profit `25%`, margin `20%`, competition/stock `15%`, and sourceability/match likelihood `10%`. Brand diversity is applied after the product passes these gates.
+
+Brand diversity is a discovery control only: it does **not** override profitability or velocity requirements. Weak products, duplicates, products without a likely sell price / max-buy-cost potential, products below the estimated 15% margin or $2 profit thresholds, weak or missing velocity candidates, overly competitive products when offer-count data is available, gift cards, subscriptions, apps/downloads, renewed/refurbished phones/electronics, carrier-locked devices, Amazon-to-Amazon resale dependencies, questionable sourceability signals, and restricted/risky brands are skipped before any brand slot is consumed.
 
 `KEEPA_MAX_NEW_PRODUCTS_PER_BRAND` means no more than 5 viable new products per normalized brand are appended per Keepa run by default. Duplicate or weak products do not count toward the 5. Once 5 viable products are selected for a brand, additional products from that brand are skipped and the scan continues looking for other brands while the scan and token guard allow it.
 
-If the current Keepa query page is dominated by brands that have already hit the per-run cap, the scanner can continue into deeper Keepa query pages until it appends the hourly target, reaches the diversity scan limit, or stops because Keepa/API behavior or token availability would require additional unexpected calls. Run Log entries include candidates fetched/evaluated, candidates deduped, candidates passing pre-ingestion score, candidates skipped as weak, products appended, brand-cap skips, top capped brands, token-limit stop/warning, and whether deeper page scanning was used.
+If the current Keepa query page is dominated by brands that have already hit the per-run cap, the scanner can continue into deeper Keepa query pages until it appends the hourly target, reaches the diversity scan limit, or stops because Keepa/API behavior or token availability would require additional unexpected calls. Run Log entries include Keepa pages scanned, page numbers scanned, products scanned, profit/margin/velocity/competition/sourceability/score rejections, candidates deduped, candidates passing pre-ingestion score, candidates skipped as weak, qualified products inserted, brand-cap skips, selected count by brand, token-limit stop/warning, and whether deeper page scanning was used.
+
+`Source Link Finder` should only receive pre-qualified Keepa rows. During queue refill, Keepa-shaped rows from `Source Search Queue` are allowed through only when they still show `Keepa Opportunity Score >= 70` and `Status = QUALIFIED`; duplicate ASIN/UPC rows are removed, while rows skipped only because of the active Source Link Finder brand cap remain queued for a later pass.
 
 `Daily Keepa Pull` includes Keepa-specific scoring fields:
 
@@ -66,6 +70,8 @@ If the current Keepa query page is dominated by brands that have already hit the
 | `Keepa Margin Signal` | Estimated margin threshold context when calculable. |
 | `Keepa Velocity Signal` | Monthly sales and sales-rank-drop context when available. |
 | `Keepa Risk Signal` | Product/category, brand restriction, and title-quality risk context. |
+
+`Qualified` and `Source Search Queue` use the Source Link Finder-compatible row shape and include trailing `Estimated Profit` and `Estimated Margin` columns so acceptance checks can verify the numeric thresholds directly before rows reach `Source Link Finder`.
 
 ## Tuning script properties
 

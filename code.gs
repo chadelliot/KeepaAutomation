@@ -51,6 +51,7 @@ function runKeepaHourlyScan() {
   let scanStopReason = '';
   let nextPage = currentPage;
   const products = [];
+  const scannedKeepaPages = [];
 
   try {
     log_(logSheet, `Started hourly Keepa scan - page ${currentPage}`);
@@ -78,6 +79,7 @@ function runKeepaHourlyScan() {
         break;
       }
 
+      scannedKeepaPages.push(page);
       log_(logSheet, `Fetched ${asins.length} ASINs from Keepa query page ${page}`);
 
       if (!asins.length) break;
@@ -135,12 +137,19 @@ function runKeepaHourlyScan() {
     if (scanStopReason === 'scan limit reached' && viableDiverseSelected < pageSize) {
       log_(logSheet, `WARNING Keepa brand diversity scan limit reached before filling target: ${viableDiverseSelected}/${pageSize} viable diverse products.`);
     }
+    if (scanStopReason === 'token budget reached' && viableDiverseSelected < pageSize) {
+      log_(logSheet, `WARNING Keepa deeper-page scan wanted more products but stopped due to token budget: selected ${viableDiverseSelected}/${pageSize}`);
+    }
 
     props.setProperty('KEEPA_QUERY_PAGE', String(nextPage));
 
     if (!products.length) {
       log_(logSheet, `Keepa pages scanned: ${pagesScanned}`);
+      log_(logSheet, `Keepa page numbers scanned: ${scannedKeepaPages.length ? scannedKeepaPages.join(', ') : 'None'}`);
       log_(logSheet, `Keepa candidates fetched: ${candidatesFetched}`);
+      log_(logSheet, 'Keepa products scanned: 0');
+      log_(logSheet, `Viable/diverse products selected: ${viableDiverseSelected}`);
+      log_(logSheet, `Deeper page scanning used: ${pagesScanned > 1 ? 'Yes' : 'No'} (${pagesScanned} page${pagesScanned === 1 ? '' : 's'})`);
       log_(logSheet, `Token-limit stop/warning: ${tokenGuard.stopReason || 'None'}${tokenGuard.tokensLeft !== null ? ` (tokens left: ${tokenGuard.tokensLeft})` : ''}`);
       log_(logSheet, `Keepa scan stop reason: ${scanStopReason}`);
       log_(logSheet, tokenGuard.stopReason ? 'No products appended because Keepa token/API guard stopped before product details were available.' : 'No ASINs returned. Check Keepa Product Finder filters or KEEPA_SELECTION_JSON.');
@@ -151,15 +160,25 @@ function runKeepaHourlyScan() {
 
     SpreadsheetApp.flush();
     log_(logSheet, `Keepa pages scanned: ${pagesScanned}`);
+    log_(logSheet, `Keepa page numbers scanned: ${scannedKeepaPages.length ? scannedKeepaPages.join(', ') : 'None'}`);
     log_(logSheet, `Keepa candidates fetched: ${candidatesFetched}`);
     log_(logSheet, `Keepa candidates evaluated: ${appendStats.evaluated}`);
+    log_(logSheet, `Keepa products scanned: ${appendStats.evaluated}`);
     log_(logSheet, `Candidates deduped: ${appendStats.duplicateSkips}`);
+    log_(logSheet, `Candidates rejected by profit: ${appendStats.profitRejects}`);
+    log_(logSheet, `Candidates rejected by margin: ${appendStats.marginRejects}`);
+    log_(logSheet, `Candidates rejected by velocity: ${appendStats.velocityRejects}`);
+    log_(logSheet, `Candidates rejected by competition/stock: ${appendStats.competitionRejects}`);
+    log_(logSheet, `Candidates rejected by sourceability/risk: ${appendStats.sourceabilityRejects}`);
+    log_(logSheet, `Candidates rejected by opportunity score: ${appendStats.scoreRejects}`);
     log_(logSheet, `Candidates passing pre-ingestion score: ${appendStats.opportunityPasses}`);
     log_(logSheet, `Candidates skipped as weak: ${appendStats.weakSkips}`);
     log_(logSheet, `Viable/diverse products selected: ${appendStats.appended}`);
+    log_(logSheet, `Qualified products inserted: ${appendStats.appended}`);
     log_(logSheet, `Products appended: ${appendStats.appended}`);
     log_(logSheet, `Products skipped due to brand cap: ${appendStats.brandCapSkips}`);
     log_(logSheet, `Top capped brands: ${appendStats.topCappedBrands || 'None'}`);
+    log_(logSheet, `Final selected count by brand: ${appendStats.selectedByBrandSummary || 'None'}`);
     log_(logSheet, `Token-limit stop/warning: ${tokenGuard.stopReason || 'None'}${tokenGuard.tokensLeft !== null ? ` (tokens left: ${tokenGuard.tokensLeft})` : ''}`);
     log_(logSheet, `Keepa scan stop reason: ${scanStopReason}`);
     log_(logSheet, `Deeper page scanning used: ${pagesScanned > 1 ? 'Yes' : 'No'} (${pagesScanned} page${pagesScanned === 1 ? '' : 's'})`);
@@ -261,8 +280,11 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
     const rowsToMove = [];
     const queueRowsToDelete = [];
+    const duplicateQueueRowsToDelete = [];
+    const unqualifiedQueueRowsToDelete = [];
     const cappedBrandSkips = {};
     let duplicateSkips = 0;
+    let unqualifiedQueueSkips = 0;
 
     for (let i = 0; i < queueValues.length && rowsToMove.length < batchLimit; i++) {
       const row = queueValues[i];
@@ -273,6 +295,13 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
       if ((asin && existingProductKeys.asins.has(asin)) || (upc && existingProductKeys.upcs.has(upc))) {
         duplicateSkips++;
+        duplicateQueueRowsToDelete.push(i + 2);
+        continue;
+      }
+
+      if (!isPreQualifiedKeepaQueueRow_(row, queueColumnCount)) {
+        unqualifiedQueueSkips++;
+        unqualifiedQueueRowsToDelete.push(i + 2);
         continue;
       }
 
@@ -290,7 +319,11 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
     if (rowsToMove.length) {
       writeRowsToFinderProductSlots_(finderSheet, rowsToMove, finderStats.emptyProductRows, finderColumnCount);
-      deleteRowsBottomUp_(queueSheet, queueRowsToDelete);
+    }
+
+    const deletedQueueRows = queueRowsToDelete.concat(duplicateQueueRowsToDelete, unqualifiedQueueRowsToDelete);
+    if (deletedQueueRows.length) {
+      deleteRowsBottomUp_(queueSheet, deletedQueueRows);
     }
 
     const skippedDueToBrandCap = Object.keys(cappedBrandSkips).reduce((sum, brand) => sum + cappedBrandSkips[brand], 0);
@@ -299,10 +332,12 @@ function moveSourceSearchQueueToSourceLinkFinder() {
 
     SpreadsheetApp.flush();
     log_(logSheet, `Rows moved to Source Link Finder: ${rowsToMove.length}`);
+    log_(logSheet, `Rows skipped due to existing ASIN/UPC dedupe: ${duplicateSkips}`);
+    log_(logSheet, `Duplicate Source Search Queue rows removed: ${duplicateQueueRowsToDelete.length}`);
+    log_(logSheet, `Rows skipped as not pre-qualified: ${unqualifiedQueueSkips}`);
     log_(logSheet, `Rows skipped due to brand cap: ${skippedDueToBrandCap}`);
     log_(logSheet, `Top brands capped: ${topBrandsCapped || 'None'}`);
     log_(logSheet, `Queue scan limit reached: ${scanLimitReached ? 'Yes' : 'No'} (${scanRows}/${queueLastRow - 1} rows scanned)`);
-    if (duplicateSkips) log_(logSheet, `Rows skipped due to existing ASIN dedupe: ${duplicateSkips}`);
     log_(logSheet, 'Completed Source Search Queue transfer');
   } catch (err) {
     log_(logSheet, `ERROR Source Search Queue transfer: ${err.message}`);
@@ -527,6 +562,7 @@ function refreshKeepaWorkbook() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   getQualifiedSheet_(ss, getOrCreateSheet_(ss, SHEETS.RUN_LOG));
   setupDailyKeepaHeaders_(ss);
+  setupQualifiedOpportunityHeaders_(ss);
   setupSerpApiColumns();
   SpreadsheetApp.flush();
 }
@@ -567,7 +603,9 @@ function setupSerpApiColumns() {
     'Profit Signal',
     'Margin Signal',
     'Velocity Signal',
-    'Match Signal'
+    'Match Signal',
+    'Estimated Profit',
+    'Estimated Margin'
   ];
 
   sheet.getRange(1, 21, 1, headers.length).setValues([headers]);
@@ -910,10 +948,10 @@ function isRiskySource_(source) {
   return /amazon|ebay|mercari|poshmark|facebook|offerup|craigslist/.test(s);
 }
 
-function isRiskyProduct_(title, brand) {
-  const t = normalize_(`${brand || ''} ${title || ''}`);
+function isRiskyProduct_(title, brand, category) {
+  const t = normalize_(`${brand || ''} ${title || ''} ${category || ''}`);
 
-  return /amazon fire|fire 7|iphone|renewed|refurb|refurbished|locked|software|download|app store|digital code|gift card|subscription|subscribe|turbotax|coin|commemorative/.test(t);
+  return /amazon fire|fire 7|iphone|smartphone|cell phone|mobile phone|renewed|refurb|refurbished|carrier locked|locked phone|locked device|software|download|app store|digital code|gift card|subscription|subscribe|turbotax|coin|commemorative/.test(t);
 }
 
 
@@ -1258,13 +1296,79 @@ function setupDailyKeepaHeaders_(ss) {
   sheet.setFrozenRows(1);
 }
 
+function setupQualifiedOpportunityHeaders_(ss) {
+  const qualifiedSheet = getQualifiedSheet_(ss, getOrCreateSheet_(ss, SHEETS.RUN_LOG));
+  const queueSheet = getOrCreateSheet_(ss, SHEETS.SOURCE_SEARCH_QUEUE);
+  const headers = getQualifiedOpportunityHeaders_();
+
+  [qualifiedSheet, queueSheet].forEach(sheet => {
+    ensureSheetColumns_(sheet, headers.length);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  });
+}
+
+function getQualifiedOpportunityHeaders_() {
+  return [
+    'Date Found',
+    'ASIN',
+    'Product Title',
+    'Brand',
+    'UPC / EAN / GTIN',
+    'Likely Sell Price',
+    'Max Buy Cost',
+    'Amazon Link',
+    'Best Search Query',
+    'Category',
+    'Keepa Link',
+    'Estimated Monthly Sales',
+    'Sales Rank',
+    'Sales Rank Drops 30D',
+    'Best Source Retailer',
+    'Best Source URL',
+    'Best Source Price',
+    'Match Confidence',
+    'Move to Source Matches',
+    'Source Notes',
+    'SerpApi Priority Score',
+    'API Search Eligible?',
+    'API Search Status',
+    'SerpApi Best Result Title',
+    'SerpApi Best Retailer',
+    'SerpApi Best Price',
+    'SerpApi Best URL',
+    'SerpApi Profit Check',
+    'SerpApi Notes',
+    'Last SerpApi Check',
+    'Opportunity Score',
+    'Profit Signal',
+    'Margin Signal',
+    'Velocity Signal',
+    'Match Signal'
+  ];
+}
+
+function appendRowsToQualifiedAndQueue_(ss, rows) {
+  const qualifiedSheet = getQualifiedSheet_(ss, getOrCreateSheet_(ss, SHEETS.RUN_LOG));
+  const queueSheet = getOrCreateSheet_(ss, SHEETS.SOURCE_SEARCH_QUEUE);
+
+  [qualifiedSheet, queueSheet].forEach(sheet => {
+    ensureSheetColumns_(sheet, rows[0].length);
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+    sheet.getRange(2, 36, Math.max(1, sheet.getLastRow() - 1), 1).setNumberFormat('$#,##0.00');
+    sheet.getRange(2, 37, Math.max(1, sheet.getLastRow() - 1), 1).setNumberFormat('0.0%');
+  });
+}
+
 function appendDailyKeepaPull_(ss, products, options) {
   const sheet = getOrCreateSheet_(ss, SHEETS.DAILY_KEEPA_PULL);
   setupDailyKeepaHeaders_(ss);
+  setupQualifiedOpportunityHeaders_(ss);
 
   const appendLimit = options && options.appendLimit ? Number(options.appendLimit) : products.length;
   const selection = selectKeepaProductsForAppend_(ss, products, appendLimit, PropertiesService.getScriptProperties());
   const rows = selection.rows;
+  const qualifiedRows = selection.qualifiedRows || [];
 
   if (!rows.length) {
     const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
@@ -1278,8 +1382,14 @@ function appendDailyKeepaPull_(ss, products, options) {
   sheet.getRange(2, 17, Math.max(1, sheet.getLastRow() - 1), 2).setNumberFormat('0.0%');
   sheet.autoResizeColumns(1, 27);
 
+  if (qualifiedRows.length) {
+    appendRowsToQualifiedAndQueue_(ss, qualifiedRows);
+  }
+
   const logSheet = getOrCreateSheet_(ss, SHEETS.RUN_LOG);
   log_(logSheet, `Appended ${rows.length} new products to Daily Keepa Pull`);
+  log_(logSheet, `Inserted ${qualifiedRows.length} pre-qualified products into Qualified`);
+  log_(logSheet, `Inserted ${qualifiedRows.length} pre-qualified products into Source Search Queue`);
   return selection;
 }
 
@@ -1287,6 +1397,7 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
   const maxPerBrand = getPositiveIntegerProperty_(props, 'KEEPA_MAX_NEW_PRODUCTS_PER_BRAND', 5);
   const existingProductKeys = getExistingProductKeysAcrossSheets_(ss, [
     SHEETS.DAILY_KEEPA_PULL,
+    SHEETS.QUALIFIED,
     SHEETS.SOURCE_LINK_FINDER,
     SHEETS.SOURCE_LINK_FINDER_ARCHIVE,
     SHEETS.SOURCE_SEARCH_QUEUE,
@@ -1297,12 +1408,20 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
   const byBrand = {};
   const stats = {
     rows: [],
+    qualifiedRows: [],
     evaluated: 0,
     opportunityPasses: 0,
     duplicateSkips: 0,
     weakSkips: 0,
+    profitRejects: 0,
+    marginRejects: 0,
+    velocityRejects: 0,
+    competitionRejects: 0,
+    sourceabilityRejects: 0,
+    scoreRejects: 0,
     brandCapSkips: 0,
     topCappedBrands: '',
+    selectedByBrandSummary: '',
     appended: 0
   };
 
@@ -1322,6 +1441,12 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
     const opportunity = evaluateKeepaIngestOpportunity_(product);
     if (!opportunity.eligible) {
       stats.weakSkips++;
+      if (opportunity.rejectReasons.profit) stats.profitRejects++;
+      if (opportunity.rejectReasons.margin) stats.marginRejects++;
+      if (opportunity.rejectReasons.velocity) stats.velocityRejects++;
+      if (opportunity.rejectReasons.competition) stats.competitionRejects++;
+      if (opportunity.rejectReasons.sourceability) stats.sourceabilityRejects++;
+      if (opportunity.rejectReasons.score) stats.scoreRejects++;
       return;
     }
 
@@ -1340,15 +1465,17 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
     if (candidates.length > maxPerBrand) cappedBrandSkips[brandKey] = candidates.length - maxPerBrand;
   });
 
-  selected
+  const finalSelection = selected
     .sort((a, b) => b.opportunity.score - a.opportunity.score)
-    .slice(0, appendLimit)
-    .forEach(item => stats.rows.push(buildKeepaRow_(item.product, item.opportunity)));
+    .slice(0, appendLimit);
 
   const selectedByBrand = {};
-  stats.rows.forEach(row => {
-    const brandKey = normalizeBrandKey_(row[3]);
+  finalSelection.forEach(item => {
+    const brandKey = normalizeBrandKey_(item.product.brand);
     selectedByBrand[brandKey] = (selectedByBrand[brandKey] || 0) + 1;
+    item.opportunity.brandDiversitySignal = `Brand diversity slot ${selectedByBrand[brandKey]}/${maxPerBrand}`;
+    stats.rows.push(buildKeepaRow_(item.product, item.opportunity));
+    stats.qualifiedRows.push(buildQualifiedOpportunityRow_(item.product, item.opportunity));
   });
   Object.keys(selectedByBrand).forEach(brandKey => {
     const overflow = Math.max(0, (byBrand[brandKey] || []).length - selectedByBrand[brandKey]);
@@ -1358,6 +1485,7 @@ function selectKeepaProductsForAppend_(ss, products, appendLimit, props) {
   stats.appended = stats.rows.length;
   stats.brandCapSkips = Object.keys(cappedBrandSkips).reduce((sum, brand) => sum + cappedBrandSkips[brand], 0);
   stats.topCappedBrands = formatTopCappedBrands_(cappedBrandSkips);
+  stats.selectedByBrandSummary = formatBrandCounts_(selectedByBrand);
   return stats;
 }
 
@@ -1365,75 +1493,205 @@ function evaluateKeepaIngestOpportunity_(product) {
   const stats = product.stats || {};
   const title = product.title || '';
   const brand = product.brand || '';
-  const likelySellPrice = centsToDollars_(getStatValue_(stats.current, 18)) || centsToDollars_(getStatValue_(stats.avg90, 18));
+  const category = getCategoryName_(product);
+  const likelySellPrice = getLikelyKeepaSellPrice_(product);
   const lowestFba = centsToDollars_(getStatValue_(stats.current, 10));
   const maxBuyCost = likelySellPrice ? round_(likelySellPrice * 0.7 - 2, 2) : 0;
-  const expectedProfit = lowestFba && maxBuyCost ? round_(lowestFba - maxBuyCost, 2) : (maxBuyCost ? 2 : 0);
+  const expectedProfit = likelySellPrice && maxBuyCost ? round_(likelySellPrice - maxBuyCost, 2) : 0;
   const margin = likelySellPrice && expectedProfit ? expectedProfit / likelySellPrice : null;
   const monthlySales = Number(product.monthlySold || product.monthlySoldHistory || 0);
   const rankDrops30 = Number(product.salesRankDrops30 || 0);
-  const hasVelocityData = monthlySales > 0 || rankDrops30 > 0;
-  const velocityStrong = monthlySales >= 50 || rankDrops30 >= 10 || !hasVelocityData;
-  const marginOk = margin === null || margin >= 0.15;
+  const salesRank = getStatValue_(stats.current, 3) || 0;
+  const newOfferCount = getStatValue_(stats.current, 11) || 0;
+  const fbaOfferCount = getFbaOfferCount_(product);
+  const hasVelocityData = monthlySales > 0 || rankDrops30 > 0 || salesRank > 0;
+  const velocityStrong = monthlySales >= 50 || rankDrops30 >= 10 || (salesRank > 0 && salesRank <= 100000);
+  const marginOk = margin !== null && margin >= 0.15;
   const profitOk = expectedProfit >= 2;
-  const allowedProduct = !isRiskyProduct_(title, brand);
+  const competitionOk = isKeepaCompetitionAcceptable_(newOfferCount, fbaOfferCount);
+  const allowedProduct = !isRiskyProduct_(title, brand, category);
   const riskAllowed = !isRestrictedKeepaBrand_(brand, product);
   const titleQualityScore = getKeepaTitleQualityScore_(title);
-  const baseScore = scoreOpportunity_({
+  const sourceable = isKeepaProductSourceable_(product, {
+    title,
+    brand,
+    category,
+    titleQualityScore,
+    allowedProduct,
+    riskAllowed
+  });
+  const componentScores = buildKeepaOpportunityComponentScores_({
+    likelySellPrice,
+    maxBuyCost,
+    expectedProfit,
+    margin,
     monthlySales,
     rankDrops30,
-    newOfferCount: getStatValue_(stats.current, 11) || 0,
-    fbaOfferCount: getFbaOfferCount_(product),
-    amazonOosPct: 0,
+    salesRank,
+    newOfferCount,
+    fbaOfferCount,
+    hasVelocityData,
+    velocityStrong,
+    competitionOk,
+    sourceable,
+    titleQualityScore,
+    allowedProduct,
+    riskAllowed,
     aboveBuyBoxSpread: lowestFba && likelySellPrice ? lowestFba - likelySellPrice : 0,
-    likelySellPrice
+    likelySellPrice,
+    hasUpc: Boolean(getUpc_(product))
   });
   const score = Math.max(0, Math.min(100, round_(
-    baseScore +
-    (maxBuyCost ? 10 : -25) +
-    (likelySellPrice ? 10 : -25) +
-    (profitOk ? 20 : -20) +
-    (marginOk ? 15 : -15) +
-    (velocityStrong ? 10 : -15) +
-    titleQualityScore +
-    (riskAllowed && allowedProduct ? 5 : -35),
+    componentScores.velocity +
+    componentScores.profit +
+    componentScores.margin +
+    componentScores.competition +
+    componentScores.sourceability,
     1
   )));
+  const rejectReasons = {
+    profit: !likelySellPrice || !maxBuyCost || !profitOk,
+    margin: !marginOk,
+    velocity: !hasVelocityData || !velocityStrong,
+    competition: !competitionOk,
+    sourceability: !allowedProduct || !riskAllowed || !sourceable,
+    score: score < 70
+  };
 
   return {
-    eligible: Boolean(maxBuyCost && likelySellPrice && marginOk && profitOk && velocityStrong && allowedProduct && riskAllowed),
+    eligible: Boolean(maxBuyCost && likelySellPrice && marginOk && profitOk && velocityStrong && competitionOk && allowedProduct && riskAllowed && sourceable && score >= 70),
     score,
     maxBuyCost,
     expectedProfit,
     margin,
-    profitSignal: buildKeepaProfitSignal_(maxBuyCost, expectedProfit),
-    marginSignal: buildKeepaMarginSignal_(margin),
-    velocitySignal: buildVelocitySignal_({ monthlySales, salesRankDrops: rankDrops30 }),
-    riskSignal: buildKeepaRiskSignal_(allowedProduct, riskAllowed, titleQualityScore)
+    componentScores,
+    rejectReasons,
+    profitSignal: buildKeepaProfitSignal_(maxBuyCost, expectedProfit, componentScores.profit),
+    marginSignal: buildKeepaMarginSignal_(margin, componentScores.margin),
+    velocitySignal: buildKeepaVelocitySignal_({ monthlySales, salesRankDrops: rankDrops30, salesRank, hasVelocityData, velocityStrong, score: componentScores.velocity }),
+    riskSignal: buildKeepaRiskSignal_(allowedProduct, riskAllowed, titleQualityScore, sourceable, componentScores)
   };
 }
 
-function buildKeepaProfitSignal_(maxBuyCost, expectedProfit) {
+function buildKeepaProfitSignal_(maxBuyCost, expectedProfit, score) {
   if (!maxBuyCost) return 'No max buy cost signal';
   if (expectedProfit === '' || expectedProfit === null || expectedProfit === undefined) return `Max buy cost $${maxBuyCost.toFixed(2)}`;
   return expectedProfit >= 2
-    ? `Profit >= $2 ($${expectedProfit.toFixed(2)}); max buy $${maxBuyCost.toFixed(2)}`
-    : `Profit below $2 ($${expectedProfit.toFixed(2)}); max buy $${maxBuyCost.toFixed(2)}`;
+    ? `Profit >= $2 ($${expectedProfit.toFixed(2)}); max buy $${maxBuyCost.toFixed(2)}; profit signal ${round_(score || 0, 1)}/25`
+    : `Profit below $2 ($${expectedProfit.toFixed(2)}); max buy $${maxBuyCost.toFixed(2)}; profit signal ${round_(score || 0, 1)}/25`;
 }
 
-function buildKeepaMarginSignal_(margin) {
+function buildKeepaMarginSignal_(margin, score) {
   if (margin === null || margin === undefined || margin === '') return 'Margin not calculable';
   return margin >= 0.15
-    ? `Margin ${(margin * 100).toFixed(0)}%`
-    : `Margin below 15% (${(margin * 100).toFixed(0)}%)`;
+    ? `Margin ${(margin * 100).toFixed(0)}%; margin signal ${round_(score || 0, 1)}/20`
+    : `Margin below 15% (${(margin * 100).toFixed(0)}%); margin signal ${round_(score || 0, 1)}/20`;
 }
 
-function buildKeepaRiskSignal_(allowedProduct, riskAllowed, titleQualityScore) {
+function buildKeepaRiskSignal_(allowedProduct, riskAllowed, titleQualityScore, sourceable, componentScores) {
   const parts = [];
   parts.push(allowedProduct ? 'Allowed product' : 'Risky product/category');
   parts.push(riskAllowed ? 'No brand restriction signal' : 'Brand/risk restriction signal');
+  parts.push(sourceable ? 'Sourceable identity' : 'Weak sourceability');
   if (titleQualityScore < 0) parts.push('Weak title quality');
+  if (componentScores) {
+    parts.push(`Competition/stock ${round_(componentScores.competition || 0, 1)}/15`);
+    parts.push(`Sourceability ${round_(componentScores.sourceability || 0, 1)}/10`);
+  }
   return parts.join('; ');
+}
+
+function buildKeepaVelocitySignal_(data) {
+  const monthlySales = Number(data.monthlySales || 0);
+  const salesRankDrops = Number(data.salesRankDrops || 0);
+  const salesRank = Number(data.salesRank || 0);
+  const score = round_(data.score || 0, 1);
+  if (!data.hasVelocityData) return `No velocity data; velocity signal ${score}/30`;
+  const strength = data.velocityStrong ? 'Strong velocity' : 'Weak velocity';
+  return `${strength}; monthly sales: ${monthlySales}; rank drops: ${salesRankDrops}; sales rank: ${salesRank || 'n/a'}; velocity signal ${score}/30`;
+}
+
+function buildKeepaOpportunityComponentScores_(data) {
+  const expectedProfit = Number(data.expectedProfit || 0);
+  const margin = Number(data.margin || 0);
+  const monthlySales = Number(data.monthlySales || 0);
+  const rankDrops30 = Number(data.rankDrops30 || 0);
+  const salesRank = Number(data.salesRank || 0);
+  const newOfferCount = Number(data.newOfferCount || 0);
+  const fbaOfferCount = Number(data.fbaOfferCount || 0);
+  const aboveBuyBoxSpread = Number(data.aboveBuyBoxSpread || 0);
+  const likelySellPrice = Number(data.likelySellPrice || 0);
+
+  let velocity = 0;
+  velocity += Math.min(12, monthlySales / 8);
+  velocity += Math.min(12, rankDrops30 * 0.8);
+  if (salesRank > 0) {
+    if (salesRank <= 25000) velocity += 6;
+    else if (salesRank <= 50000) velocity += 4;
+    else if (salesRank <= 100000) velocity += 2;
+  }
+  if (!data.hasVelocityData || !data.velocityStrong) velocity = Math.min(velocity, 12);
+
+  const profit = Math.min(25, Math.max(0, (expectedProfit / 8) * 25));
+  const marginScore = Math.min(20, Math.max(0, ((margin - 0.15) / 0.2) * 20));
+
+  let competition = 0;
+  if (!fbaOfferCount) competition += 4;
+  else if (fbaOfferCount <= 5) competition += 9;
+  else if (fbaOfferCount <= 10) competition += 6;
+  else if (fbaOfferCount <= 20) competition += 3;
+
+  if (!newOfferCount) competition += 2;
+  else if (newOfferCount <= 12) competition += 4;
+  else if (newOfferCount <= 30) competition += 2;
+
+  if (aboveBuyBoxSpread > 0 && likelySellPrice > 0) {
+    competition += Math.min(2, (aboveBuyBoxSpread / likelySellPrice) * 20);
+  }
+  if (!data.competitionOk) competition = Math.min(competition, 5);
+
+  let sourceability = 0;
+  if (data.hasUpc) sourceability += 4;
+  if (data.allowedProduct && data.riskAllowed) sourceability += 3;
+  if (data.sourceable) sourceability += 2;
+  if (data.titleQualityScore > 0) sourceability += 1;
+  if (!data.sourceable) sourceability = Math.min(sourceability, 4);
+
+  return {
+    velocity: round_(Math.min(30, velocity), 1),
+    profit: round_(profit, 1),
+    margin: round_(marginScore, 1),
+    competition: round_(Math.min(15, competition), 1),
+    sourceability: round_(Math.min(10, sourceability), 1)
+  };
+}
+
+function getLikelyKeepaSellPrice_(product) {
+  const stats = product.stats || {};
+  return centsToDollars_(getStatValue_(stats.current, 18)) ||
+    centsToDollars_(getStatValue_(stats.avg90, 18)) ||
+    centsToDollars_(getStatValue_(stats.current, 1)) ||
+    centsToDollars_(getStatValue_(stats.avg90, 1));
+}
+
+function isKeepaCompetitionAcceptable_(newOfferCount, fbaOfferCount) {
+  const newOffers = Number(newOfferCount || 0);
+  const fbaOffers = Number(fbaOfferCount || 0);
+  if (fbaOffers && fbaOffers > 20) return false;
+  if (newOffers && newOffers > 60) return false;
+  return true;
+}
+
+function isKeepaProductSourceable_(product, signals) {
+  const title = signals.title || '';
+  const brand = signals.brand || '';
+  const category = signals.category || '';
+  const text = normalize_(`${brand} ${title} ${category}`);
+  if (!signals.allowedProduct || !signals.riskAllowed) return false;
+  if (signals.titleQualityScore < 0) return false;
+  if (/amazon basics|amazonbasics|kindle|fire tv|echo dot|alexa/.test(text)) return false;
+  if (/replacement part|parts only|for parts|repair kit|screen only|battery only/.test(text)) return false;
+  return Boolean(getUpc_(product) || (brand && title && normalize_(title).split(' ').length >= 4));
 }
 
 function getKeepaTitleQualityScore_(title) {
@@ -1522,7 +1780,7 @@ function buildKeepaRow_(product, opportunity) {
 
   const currentBuyBox = centsToDollars_(getStatValue_(stats.current, 18));
   const avgBuyBox90 = centsToDollars_(getStatValue_(stats.avg90, 18));
-  const likelySellPrice = currentBuyBox || avgBuyBox90 || '';
+  const likelySellPrice = getLikelyKeepaSellPrice_(product) || '';
 
   const monthlySales = product.monthlySold || product.monthlySoldHistory || '';
   const salesRank = getStatValue_(stats.current, 3) || '';
@@ -1548,6 +1806,10 @@ function buildKeepaRow_(product, opportunity) {
   if (Number(monthlySales) >= 100) notes.push('Demand signal');
   if (Number(rankDrops30) >= 15) notes.push('Sales-rank movement');
   if (keepaOpportunity.maxBuyCost) notes.push(`Estimated max buy cost: $${keepaOpportunity.maxBuyCost.toFixed(2)}`);
+  if (keepaOpportunity.brandDiversitySignal) notes.push(keepaOpportunity.brandDiversitySignal);
+  if (keepaOpportunity.componentScores) {
+    notes.push(`Score components V/P/M/C/S: ${round_(keepaOpportunity.componentScores.velocity || 0, 1)}/${round_(keepaOpportunity.componentScores.profit || 0, 1)}/${round_(keepaOpportunity.componentScores.margin || 0, 1)}/${round_(keepaOpportunity.componentScores.competition || 0, 1)}/${round_(keepaOpportunity.componentScores.sourceability || 0, 1)}`);
+  }
 
   return [
     new Date(),
@@ -1577,6 +1839,68 @@ function buildKeepaRow_(product, opportunity) {
     keepaOpportunity.riskSignal,
     status,
     notes.join('; ')
+  ];
+}
+
+function buildQualifiedOpportunityRow_(product, opportunity) {
+  const asin = product.asin || '';
+  const stats = product.stats || {};
+  const keepaOpportunity = opportunity || evaluateKeepaIngestOpportunity_(product);
+  const title = product.title || '';
+  const brand = product.brand || '';
+  const category = getCategoryName_(product);
+  const upc = getUpc_(product);
+  const likelySellPrice = getLikelyKeepaSellPrice_(product) || '';
+  const monthlySales = product.monthlySold || product.monthlySoldHistory || '';
+  const salesRank = getStatValue_(stats.current, 3) || '';
+  const rankDrops30 = product.salesRankDrops30 || '';
+  const amazonLink = asin ? `https://www.amazon.com/dp/${asin}` : '';
+  const keepaLink = asin ? `https://keepa.com/#!product/1-${asin}` : '';
+  const searchQuery = buildSerpApiQuery_('', upc, title, brand);
+  const score = keepaOpportunity.score || 0;
+  const matchSignal = [
+    keepaOpportunity.riskSignal,
+    keepaOpportunity.brandDiversitySignal
+  ].filter(Boolean).join('; ');
+
+  return [
+    new Date(),
+    asin,
+    title,
+    brand,
+    upc,
+    likelySellPrice,
+    keepaOpportunity.maxBuyCost || '',
+    amazonLink,
+    searchQuery,
+    category,
+    keepaLink,
+    monthlySales,
+    salesRank,
+    rankDrops30,
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    score,
+    'Yes',
+    'Ready',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    score,
+    keepaOpportunity.profitSignal,
+    keepaOpportunity.marginSignal,
+    keepaOpportunity.velocitySignal,
+    matchSignal,
+    keepaOpportunity.expectedProfit || '',
+    keepaOpportunity.margin || ''
   ];
 }
 
@@ -1670,6 +1994,20 @@ function rowHasProductIdentity_(row) {
   return Boolean(String(row[1] || '').trim() || String(row[2] || '').trim());
 }
 
+function isPreQualifiedKeepaQueueRow_(row, columnCount) {
+  if (columnCount < 27) return true;
+
+  const keepaOpportunityScore = toNumber_(row[20]); // U
+  if (keepaOpportunityScore < 70) return false;
+
+  const apiEligible = normalize_(row[21]); // V
+  const apiStatus = normalize_(row[22]); // W
+  if (apiEligible || apiStatus) return apiEligible === 'yes' && apiStatus === 'ready';
+
+  const keepaStatus = normalize_(row[25]); // Z in Daily Keepa Pull-shaped legacy queue rows
+  return keepaStatus === 'qualified';
+}
+
 function hasApprovedMoveDecision_(row) {
   return normalize_(row[18]) === 'yes'; // S
 }
@@ -1747,6 +2085,13 @@ function formatTopCappedBrands_(cappedBrandSkips) {
     .sort((a, b) => cappedBrandSkips[b] - cappedBrandSkips[a])
     .slice(0, 10)
     .map(brand => `${brand}: ${cappedBrandSkips[brand]}`)
+    .join(', ');
+}
+
+function formatBrandCounts_(brandCounts) {
+  return Object.keys(brandCounts)
+    .sort((a, b) => brandCounts[b] - brandCounts[a] || a.localeCompare(b))
+    .map(brand => `${brand}: ${brandCounts[brand]}`)
     .join(', ');
 }
 
